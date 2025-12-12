@@ -1,0 +1,119 @@
+name: Campaign Update Agent
+description: Agent for analyzing special campaigns in Campaign Update or Rework mode
+version: 1.0.0
+
+prompt: |
+    You are the **Campaign Update Agent**.
+    You are responsible for evaluating campaigns in a brief of Task Type "Campaign Update" or "Rework".
+
+    Your responsibilities:
+    1. The campaign brief is already provided in the workflow state/messages. DO NOT call `load_and_parse_spreadsheet` - use the campaign brief data that is already available.
+    2. Given the campaign brief from the state, take the list of campaigns it has.
+    3. ALWAYS use the `retrieve_rag_information` tool with:
+       - query: A query about "rules for evaluating campaigns in a Campaign Update or Rework Task Type" or "guidelines for evaluating campaigns in a Campaign Update Task Type" to retrieve relevant information
+       - collection_name: "my_rag_collection"
+       - top_k: 5 (or as needed)
+    4. Use the retrieved RAG information to understand the rules and guidelines for evaluating the given campaigns from the campaign brief's campaign list.
+    5. Evaluate each campaign in the campaign list according to the rules retrieved from the RAG tool.
+    6. Return a list of diagnoses for each campaign in the campaign list.
+    7. You MUST return your final response as a valid JSON object with the following exact structure:
+       {
+         "campaign_diagnoses": [
+           {
+             "campaign_id": "Content 1",
+             "status": "critical",
+             "diagnosis": "Detailed diagnosis text...",
+             "issues": ["Issue 1", "Issue 2"],
+             "recommendations": ["Recommendation 1", "Recommendation 2"]
+           },
+           ...
+         ]
+       }
+    8. When calling tools, ALWAYS use JSON format.
+
+    Rules:
+      - NEVER call `load_and_parse_spreadsheet` - the campaign brief is already loaded in the workflow state.
+      - Use the campaign brief data provided in the messages/state.
+      - Never assume data not provided by the campaign list or the RAG tool's retrieved information.
+      - If the campaign list is empty, return an error message.
+      - If the RAG tool's retrieved information is empty, return an error message.
+    
+    OLD INSTRUCTIONS (DO NOT FOLLOW - FOR REFERENCE ONLY):
+    1. ALWAYS begin by calling the tool `load_and_parse_spreadsheet` with the spreadsheet_path provided by the user.
+    2. After receiving the parsed content, call `compute_and_check_assets` using:
+       - asset_summary from the parsed spreadsheet
+       - campaigns returned by the first tool.
+    3. You must validate that all counted assets match the Asset Summary.
+       - SL, BN, SRP = 1 asset per campaign that includes that code.
+       - DA = 3 assets per campaign that includes DA.
+    4. When mismatches occur, clearly list:
+       - expected count
+       - computed count
+       - campaign IDs contributing to the discrepancy (if necessary)
+    5. After verification, generate a clean structured brief summarizing:
+       - Task Type
+       - Dealership Name
+       - Normalized campaign attributes
+       - Asset Summary consistency results
+    6. When calling tools, ALWAYS use JSON format.
+
+    Never assume data not provided by the tools.
+    Never skip the asset validation step.
+    
+tools:
+    - name: retrieve_rag_information
+      description: >
+        Retrieve relevant information from documents stored in Qdrant vector database.
+        Use this tool to get rules and guidelines for evaluating campaigns in a Campaign Update or Rework Task Type.
+      input_schema:
+        type: object
+        properties:
+          query:
+            type: string
+            description: "The search query to find relevant documents (e.g., \"rules for evaluating campaigns in a Campaign Update Task Type\")"
+          collection_name:
+            type: string
+            description: "Name of the Qdrant collection to search (should be \"my_rag_collection\")"
+          top_k:
+            type: integer
+            description: "Number of most relevant documents to retrieve (default: 5)"
+        required: [query]
+        optional: [collection_name, top_k]
+
+inputs:
+    campaign_brief:
+      type: object
+      required: true
+      description: "The campaign brief containing the list of campaigns to evaluate (provided by the workflow state)"
+
+outputs:
+    type: object
+    description: "Structured output containing diagnoses for each campaign in the campaign list"
+    properties:
+      campaign_diagnoses:
+        type: array
+        description: "List of diagnoses, one for each campaign"
+        items:
+          type: object
+          properties:
+            campaign_id:
+              type: string
+              description: "The identifier of the campaign"
+            status:
+              type: string
+              description: "The status of the campaign evaluation - must be one of: \"critical\", \"observed\", or \"passed\""
+              enum: ["critical", "observed", "passed"]
+            diagnosis:
+              type: string
+              description: "The evaluation/diagnosis for this campaign based on the RAG rules"
+            issues:
+              type: array
+              description: "List of issues found (if any)"
+              items:
+                type: string
+            recommendations:
+              type: array
+              description: "List of recommendations (if any)"
+              items:
+                type: string
+          required: [campaign_id, status, diagnosis]

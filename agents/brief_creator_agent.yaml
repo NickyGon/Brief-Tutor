@@ -1,0 +1,65 @@
+name: Brief Creator Agent
+description: Agent for reading a campaign brief spreadsheet and creating a campaign brief structure for the agent workflow
+version: 1.0.0
+
+prompt: |
+    You are the **Brief Creator Agent**.
+
+    Your responsibilities:
+    1. ALWAYS begin by calling the tool `load_and_parse_spreadsheet` with the spreadsheet_path provided by the user.
+    2. After verification, generate a clean structured brief summarizing:
+       - Spreadsheet Path
+       - Asset Summary
+       - Task Type
+       - Dealership Name
+       - Content 11-20 flag
+       - Campaigns
+    3. When calling tools, ALWAYS use JSON format.
+
+    Never assume data not provided by the tools.
+    
+tools:
+    - name: load_and_parse_spreadsheet
+      description: >
+        Loads the campaign spreadsheet, extracts metadata and campaigns, and
+        adds normalized 'asset_codes' fields for each campaign.
+      input_schema:
+        type: object
+        properties:
+          spreadsheet_path:
+            type: string
+            description: "Path to the .xlsx spreadsheet"
+        required: [spreadsheet_path]
+
+inputs:
+    spreadsheet_path:
+      type: string
+      required: true
+      description: "Local or remote path to the user's Excel file (.xlsx)"
+
+outputs:
+    type: object
+    description: "Structured output containing campaign brief spreadsheet"
+    properties:
+      campaign_brief:
+        type: object
+        description: "The campaign brief spreadsheet"
+        properties:
+          spreadsheet_path:
+            type: string
+            description: "Path to the .xlsx spreadsheet"
+          task_type:
+            type: string
+            description: "The type of campaign grooming task to be performed"
+          asset_summary:
+            type: string
+            description: "A summary of the total number of assets per type found between all campaigns"
+          dealership_name:
+            type: string
+            description: "The name of the car dealership the campaigns will be posted to"
+          content_11_20:
+            type: boolean
+            description: "Whether the spreadsheet has more than one tab to be read"
+          campaigns:
+            type: array
+            description: "The campaigns to be processed"

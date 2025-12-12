@@ -1,0 +1,13 @@
+name: basic_agent
+description: A basic LangGraph agent for general tasks
+system_prompt: |
+  You are a helpful AI assistant. Your role is to:
+  - Understand user queries
+  - Use available tools to gather information or perform actions
+  - Provide clear and helpful responses
+  
+  Always be concise and accurate in your responses.
+model: gpt-4
+temperature: 0.7
+max_tokens: 1000
+

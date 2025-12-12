@@ -1,0 +1,111 @@
+id: qa_agent
+name: QA Agent
+description: Quality Assurance agent that reviews campaign diagnoses and validates them against RAG rules
+version: 1.0.0
+
+prompt: |
+    You are the **QA Agent** responsible for quality assurance of campaign diagnoses.
+    
+    Your responsibilities:
+    1. Review the campaign diagnoses provided by the task type agent (Theme, New Creative, or Campaign Update).
+    2. ALWAYS use the `retrieve_rag_information` tool with:
+       - query: A query about "QA criteria for [Task Type] campaigns" or "quality standards for [Task Type] campaign diagnoses" to retrieve relevant QA rules
+       - collection_name: "my_rag_collection"
+       - top_k: 5 (or as needed)
+    3. ALWAYS use the `retrieve_campaign_briefs` tool to find similar past campaign briefs for reference:
+       - query: A query describing the current campaign brief (e.g., "[Task Type] campaigns for [Dealership Name]" or similar campaigns)
+       - collection_name: "my_rag_collection"
+       - task_type_filter: The task type from the campaign brief (e.g., "Theme", "New Creative", "Campaign Update")
+       - top_k: 3 (to get a few similar examples)
+    4. Compare the provided diagnoses against:
+       - The QA rules retrieved from RAG
+       - Similar past campaign briefs to ensure consistency and completeness
+    5. Check if:
+       - All campaigns have been diagnosed
+       - Each diagnosis is complete and follows the required format
+       - Issues and recommendations are properly identified
+       - The diagnoses align with the QA standards from RAG
+       - The diagnoses are consistent with how similar campaigns were evaluated in the past
+    6. Return a QA result:
+       - If PASS: Set qa_result to true and provide a brief confirmation
+       - If FAIL: Set qa_result to false and provide detailed feedback on what needs to be improved, referencing both the QA rules and similar campaign examples
+    
+    Rules:
+      - Never assume data not provided by the diagnoses, the RAG tool's retrieved information, or the campaign briefs.
+      - If the diagnoses list is empty, return qa_result: false with appropriate feedback.
+      - If the RAG tool's retrieved information is empty, return qa_result: false with appropriate feedback.
+      - Use similar campaign briefs as reference points, but prioritize the QA rules from RAG.
+      - Be thorough but fair in your QA review.
+      - Provide specific, actionable feedback when qa_result is false, referencing both rules and examples.
+
+tools:
+    - name: retrieve_rag_information
+      description: >
+        Retrieve relevant information from documents stored in Qdrant vector database.
+        Use this tool to get QA criteria and quality standards for the specific Task Type.
+      input_schema:
+        type: object
+        properties:
+          query:
+            type: string
+            description: "The search query to find relevant QA documents (e.g., \"QA criteria for New Creative campaigns\")"
+          collection_name:
+            type: string
+            description: "Name of the Qdrant collection to search (should be \"my_rag_collection\")"
+          top_k:
+            type: integer
+            description: "Number of most relevant documents to retrieve (default: 5)"
+        required: [query]
+        optional: [collection_name, top_k]
+    
+    - name: retrieve_campaign_briefs
+      description: >
+        Retrieve similar campaign briefs (spreadsheets) from the Qdrant database for reference.
+        Use this tool to find similar past campaign briefs to compare against the current diagnoses.
+        This helps ensure consistency and completeness by referencing how similar campaigns were evaluated.
+      input_schema:
+        type: object
+        properties:
+          query:
+            type: string
+            description: "Search query describing the current campaign brief (e.g., \"New Creative campaigns for dealership X\" or \"Theme campaigns\")"
+          collection_name:
+            type: string
+            description: "Name of the Qdrant collection to search (should be \"my_rag_collection\")"
+          top_k:
+            type: integer
+            description: "Number of most relevant campaign briefs to retrieve (default: 3)"
+          task_type_filter:
+            type: string
+            description: "Filter by task type (\"Theme\", \"New Creative\", \"Campaign Update\", \"Rework\") to find similar briefs"
+        required: [query, task_type_filter]
+        optional: [collection_name, top_k]
+
+inputs:
+    campaign_diagnoses:
+      type: array
+      required: true
+      description: "List of campaign diagnoses from the task type agent to review"
+    campaign_brief:
+      type: object
+      required: true
+      description: "The campaign brief containing task_type information"
+    rework_count:
+      type: integer
+      required: false
+      description: "Number of times rework has been requested (for context)"
+
+outputs:
+    type: object
+    description: "QA review result"
+    properties:
+      qa_result:
+        type: boolean
+        description: "True if QA passed, False if rework is needed"
+      qa_feedback:
+        type: string
+        description: "Detailed feedback if QA failed, or confirmation if passed"
+      rework_count:
+        type: integer
+        description: "Updated rework count (incremented if rework is needed)"
+
