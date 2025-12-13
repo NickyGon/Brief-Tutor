@@ -425,22 +425,14 @@ def _get_qdrant_client():
     if not QDRANT_AVAILABLE:
         return None
     
-    qdrant_host = os.getenv("QDRANT_HOST", "localhost")
-    qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
-    qdrant_api_key = os.getenv("QDRANT_API_KEY", None)
-    
-    try:
-        if qdrant_api_key:
-            client = QdrantClient(
-                url=f"http://{qdrant_host}:{qdrant_port}",
-                api_key=qdrant_api_key
-            )
-        else:
-            client = QdrantClient(host=qdrant_host, port=qdrant_port)
-        return client
-    except Exception as e:
-        print(f"Warning: Could not connect to Qdrant: {e}")
-        return None
+    url = os.environ.get("QDRANT_URL")
+    api_key = os.environ.get("QDRANT_API_KEY")
+
+    if not url:
+        raise RuntimeError("QDRANT_URL env var is not set")
+
+    client = QdrantClient(url=url, api_key=api_key)
+    return client
 
 
 def _get_qdrant_vectorstore(collection_name: str = None):
