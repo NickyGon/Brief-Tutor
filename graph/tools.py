@@ -6,6 +6,7 @@ from langchain.tools import tool
 from graph.models import Campaign, CampaignBrief, OfferDetails, StyleDescriptions, Assets
 from collections import Counter
 import re
+import json
 import pandas as pd
 import os
 from dotenv import load_dotenv
@@ -553,8 +554,12 @@ def retrieve_rag_information(
             structured_brief = payload.get("structured_brief")
             file_type_actual = payload.get("file_type")
             
-            if structured_brief or file_type_actual == "campaign_brief":
-                # Format as structured campaign brief information
+            # Check for new format (per-campaign documents) or old format (structured_brief)
+            campaign_json = payload.get("campaign_json")
+            brief_metadata = payload.get("brief_metadata")
+            
+            if structured_brief and isinstance(structured_brief, dict):
+                # Old format: structured campaign brief
                 brief_info = []
                 brief_info.append(f"Campaign Brief {i}: {structured_brief.get('file_name', 'Unknown')}")
                 brief_info.append(f"  Task Type: {structured_brief.get('task_type', 'Unknown')}")
@@ -567,11 +572,38 @@ def retrieve_rag_information(
                 if campaigns:
                     brief_info.append(f"  Campaigns:")
                     for camp in campaigns[:5]:  # Limit to first 5 for brevity
-                        brief_info.append(f"    - {camp.get('campaign_id', 'Unknown')}: {camp.get('headline', '')[:50]}...")
+                        if camp and isinstance(camp, dict):
+                            brief_info.append(f"    - {camp.get('campaign_id', 'Unknown')}: {camp.get('headline', '')[:50]}...")
                     if len(campaigns) > 5:
                         brief_info.append(f"    ... and {len(campaigns) - 5} more campaigns")
                 
                 brief_info.append(f"\n  Full Text Content:\n{content}")
+                results.append("\n".join(brief_info))
+            elif campaign_json and isinstance(campaign_json, dict):
+                # New format: per-campaign document
+                brief_info = []
+                if brief_metadata and isinstance(brief_metadata, dict):
+                    brief_info.append(f"Campaign {i}: {brief_metadata.get('file_name', 'Unknown')}")
+                    brief_info.append(f"  Task Type: {brief_metadata.get('task_type', 'Unknown')}")
+                    brief_info.append(f"  Dealership: {brief_metadata.get('dealership_name', 'Unknown')}")
+                else:
+                    brief_info.append(f"Campaign {i}: {campaign_json.get('campaign_id', 'Unknown')}")
+                
+                # Add campaign details
+                offer_details = campaign_json.get('offer_details', {})
+                if offer_details and isinstance(offer_details, dict):
+                    brief_info.append(f"  Headline: {offer_details.get('headline', 'N/A')}")
+                    brief_info.append(f"  Offer: {offer_details.get('offer', 'N/A')}")
+                
+                brief_info.append(f"\n  Full Campaign JSON:\n{json.dumps(campaign_json, indent=2)}")
+                brief_info.append(f"\n  Full Text Content:\n{content}")
+                results.append("\n".join(brief_info))
+            elif file_type_actual == "campaign" or file_type_actual == "campaign_brief":
+                # Fallback: campaign-related document but no structured data
+                brief_info = []
+                brief_info.append(f"Campaign Document {i}:")
+                brief_info.append(f"  File Type: {file_type_actual}")
+                brief_info.append(f"  Content:\n{content}")
                 results.append("\n".join(brief_info))
             else:
                 # Regular document
@@ -668,9 +700,14 @@ def retrieve_campaign_briefs(
         for result in points:
             payload = result.payload or {}
             structured_brief = payload.get("structured_brief")
+            campaign_json = payload.get("campaign_json")
+            brief_metadata = payload.get("brief_metadata")
             
-            if structured_brief:
-                filtered_briefs.append((result, structured_brief))
+            # Accept either old format (structured_brief) or new format (campaign_json + brief_metadata)
+            if structured_brief and isinstance(structured_brief, dict):
+                filtered_briefs.append(("old", result, structured_brief))
+            elif campaign_json and isinstance(campaign_json, dict):
+                filtered_briefs.append(("new", result, campaign_json, brief_metadata))
         
         if not filtered_briefs:
             filter_msg = f" (filtered by task_type: {task_type_filter})" if task_type_filter else ""
@@ -678,21 +715,37 @@ def retrieve_campaign_briefs(
         
         # Format the retrieved briefs
         results = []
-        for i, (result, structured_brief) in enumerate(filtered_briefs, 1):
+        for i, brief_data in enumerate(filtered_briefs, 1):
             brief_info = []
             brief_info.append(f"Similar Campaign Brief {i}:")
-            brief_info.append(f"  File Name: {structured_brief.get('file_name', 'Unknown')}")
-            brief_info.append(f"  Task Type: {structured_brief.get('task_type', 'Unknown')}")
-            brief_info.append(f"  Dealership: {structured_brief.get('dealership_name', 'Unknown')}")
-            brief_info.append(f"  Total Campaigns: {structured_brief.get('total_campaigns', len(structured_brief.get('campaigns', [])))}")
-            brief_info.append(f"  Asset Summary: {structured_brief.get('asset_summary', 'N/A')}")
             
-            # Include campaign details
-            campaigns = structured_brief.get('campaigns', [])
-            if campaigns:
-                brief_info.append(f"  Campaigns:")
-                for camp in campaigns:
-                    brief_info.append(f"    - {camp.get('campaign_id', 'Unknown')}: {camp.get('headline', 'N/A')}")
+            if brief_data[0] == "old":
+                # Old format: structured_brief
+                _, result, structured_brief = brief_data
+                brief_info.append(f"  File Name: {structured_brief.get('file_name', 'Unknown')}")
+                brief_info.append(f"  Task Type: {structured_brief.get('task_type', 'Unknown')}")
+                brief_info.append(f"  Dealership: {structured_brief.get('dealership_name', 'Unknown')}")
+                brief_info.append(f"  Total Campaigns: {structured_brief.get('total_campaigns', len(structured_brief.get('campaigns', [])))}")
+                brief_info.append(f"  Asset Summary: {structured_brief.get('asset_summary', 'N/A')}")
+                
+                # Include campaign details
+                campaigns = structured_brief.get('campaigns', [])
+                if campaigns:
+                    brief_info.append(f"  Campaigns:")
+                    for camp in campaigns:
+                        if camp and isinstance(camp, dict):
+                            brief_info.append(f"    - {camp.get('campaign_id', 'Unknown')}: {camp.get('headline', 'N/A')}")
+            else:
+                # New format: campaign_json + brief_metadata
+                _, result, campaign_json, brief_metadata = brief_data
+                if brief_metadata and isinstance(brief_metadata, dict):
+                    brief_info.append(f"  File Name: {brief_metadata.get('file_name', 'Unknown')}")
+                    brief_info.append(f"  Task Type: {brief_metadata.get('task_type', 'Unknown')}")
+                    brief_info.append(f"  Dealership: {brief_metadata.get('dealership_name', 'Unknown')}")
+                brief_info.append(f"  Campaign ID: {campaign_json.get('campaign_id', 'Unknown')}")
+                offer_details = campaign_json.get('offer_details', {})
+                if offer_details and isinstance(offer_details, dict):
+                    brief_info.append(f"  Headline: {offer_details.get('headline', 'N/A')}")
             
             results.append("\n".join(brief_info))
         
