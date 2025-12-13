@@ -3,6 +3,7 @@ langchain
 langchain-core
 langchain-openai
 langchain-community
+langchain-qdrant
 qdrant-client
 openpyxl
 pydantic

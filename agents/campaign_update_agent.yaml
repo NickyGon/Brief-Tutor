@@ -38,27 +38,6 @@ prompt: |
       - If the campaign list is empty, return an error message.
       - If the RAG tool's retrieved information is empty, return an error message.
     
-    OLD INSTRUCTIONS (DO NOT FOLLOW - FOR REFERENCE ONLY):
-    1. ALWAYS begin by calling the tool `load_and_parse_spreadsheet` with the spreadsheet_path provided by the user.
-    2. After receiving the parsed content, call `compute_and_check_assets` using:
-       - asset_summary from the parsed spreadsheet
-       - campaigns returned by the first tool.
-    3. You must validate that all counted assets match the Asset Summary.
-       - SL, BN, SRP = 1 asset per campaign that includes that code.
-       - DA = 3 assets per campaign that includes DA.
-    4. When mismatches occur, clearly list:
-       - expected count
-       - computed count
-       - campaign IDs contributing to the discrepancy (if necessary)
-    5. After verification, generate a clean structured brief summarizing:
-       - Task Type
-       - Dealership Name
-       - Normalized campaign attributes
-       - Asset Summary consistency results
-    6. When calling tools, ALWAYS use JSON format.
-
-    Never assume data not provided by the tools.
-    Never skip the asset validation step.
     
 tools:
     - name: retrieve_rag_information

@@ -18,7 +18,7 @@ try:
     from qdrant_client import QdrantClient
     from qdrant_client.models import Distance, VectorParams
     from langchain_openai import OpenAIEmbeddings
-    from langchain_community.vectorstores import Qdrant
+    from langchain_qdrant import Qdrant
     QDRANT_AVAILABLE = True
 except ImportError:
     QDRANT_AVAILABLE = False
@@ -531,20 +531,27 @@ def retrieve_rag_information(
                 )]
             )
         
-        search_results = client.search(
+        # Use query_points method (correct Qdrant client API)
+        search_results = client.query_points(
             collection_name=collection_name_actual,
-            query_vector=query_vector,
+            query=query_vector,
             query_filter=search_filter,
             limit=top_k,
             with_payload=True
         )
         
-        if not search_results:
+        # Extract points from the response
+        if hasattr(search_results, 'points'):
+            points = search_results.points
+        else:
+            points = []
+        
+        if not points:
             return f"No relevant documents found for query: '{query}'"
         
         # Format the retrieved documents
         results = []
-        for i, result in enumerate(search_results, 1):
+        for i, result in enumerate(points, 1):
             payload = result.payload or {}
             
             # Extract content - it might be in different fields
@@ -645,22 +652,28 @@ def retrieve_campaign_briefs(
                 )
             )
         
-        # Search directly with Qdrant client
-        search_results = client.search(
+        # Search directly with Qdrant client using query_points
+        search_results = client.query_points(
             collection_name=collection_name_actual,
-            query_vector=query_vector,
+            query=query_vector,
             query_filter=search_filter,
             limit=top_k,
             with_payload=True
         )
         
-        if not search_results:
+        # Extract points from the response
+        if hasattr(search_results, 'points'):
+            points = search_results.points
+        else:
+            points = []
+        
+        if not points:
             filter_msg = f" (filtered by task_type: {task_type_filter})" if task_type_filter else ""
             return f"No relevant campaign briefs found for query: '{query}'{filter_msg}"
         
         # Format the retrieved briefs
         filtered_briefs = []
-        for result in search_results:
+        for result in points:
             payload = result.payload or {}
             structured_brief = payload.get("structured_brief")
             

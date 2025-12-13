@@ -17,6 +17,9 @@ DEFAULT_MODEL = "gpt-5-nano" # Optimal for speed and cost
 DEFAULT_MAX_TOKENS = 1000
 DEFAULT_TEMPERATURE = 0.7  # Optimal for RAG and structured data processing
 
+# Higher token limits for agents that need to generate multiple diagnoses
+TASK_AGENT_MAX_TOKENS = 4000  # For theme_agent, new_creative_agent, campaign_update_agent
+
 
 def load_agent_config(yaml_path: str) -> Dict[str, Any]:
     """
@@ -50,10 +53,13 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
     node_name = config.get("name", "agent").lower().replace(" ", "_")
     
     # Create LLM with specified parameters
+    # Task-specific agents need more tokens to generate diagnoses for multiple campaigns
+    max_tokens = TASK_AGENT_MAX_TOKENS if node_name in ["theme_agent", "new_creative_agent", "campaign_update_agent"] else DEFAULT_MAX_TOKENS
+    
     llm = ChatOpenAI(
         model=DEFAULT_MODEL,
         temperature=DEFAULT_TEMPERATURE,
-        max_tokens=DEFAULT_MAX_TOKENS
+        max_tokens=max_tokens
     )
     
     # Get the system prompt from config
@@ -72,10 +78,30 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
         messages = state.messages.copy() if state.messages else []
         
         # Add system message if prompt exists
+        # Remove any existing system messages first to ensure each agent gets its own
         if system_prompt:
-            # Check if system message already exists
-            if not messages or not isinstance(messages[0], dict) or messages[0].get("role") != "system":
-                messages.insert(0, {"role": "system", "content": system_prompt})
+            # Remove all existing system messages (both dict format and SystemMessage objects)
+            filtered_messages = []
+            removed_count = 0
+            for msg in messages:
+                is_system = False
+                if isinstance(msg, dict):
+                    is_system = msg.get("role") == "system"
+                elif isinstance(msg, SystemMessage):
+                    is_system = True
+                
+                if not is_system:
+                    filtered_messages.append(msg)
+                else:
+                    removed_count += 1
+            
+            if removed_count > 0:
+                print(f"[{node_name}] Removed {removed_count} existing system message(s), adding agent-specific system message")
+            
+            messages = filtered_messages
+            
+            # Add the current agent's system message at the beginning
+            messages.insert(0, {"role": "system", "content": system_prompt})
         
         # For task-specific agents (not brief_creator), add campaign_brief to initial message if available
         # This prevents them from reloading the spreadsheet during rework cycles
@@ -122,6 +148,7 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
         
         # Invoke agent
         response = agent.invoke({"messages": langchain_messages})
+        print(f"[{node_name}] Agent response: {response}")
         
         # Convert response back to dict format and extract tool results
         updated_messages = messages.copy()
@@ -136,7 +163,23 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
                 if isinstance(msg, AIMessage):
                     # Try to extract campaign_diagnoses from agent's response
                     content = msg.content
-                    if isinstance(content, str):
+                    
+                    # Check for empty content (might indicate token limit was hit)
+                    if not content or (isinstance(content, str) and not content.strip()):
+                        # Check if token limit was hit
+                        metadata = getattr(msg, 'response_metadata', {})
+                        finish_reason = metadata.get('finish_reason', '')
+                        if finish_reason == 'length':
+                            print(f"[{node_name}] ⚠️  WARNING: Agent response was truncated due to token limit!")
+                            print(f"           Consider increasing max_tokens or reducing campaign count.")
+                            if node_name in ["theme_agent", "new_creative_agent", "campaign_update_agent"]:
+                                print(f"           Current max_tokens: {max_tokens}")
+                        elif finish_reason:
+                            print(f"[{node_name}] ⚠️  Agent response finished with reason: {finish_reason}")
+                        else:
+                            print(f"[{node_name}] ⚠️  WARNING: Agent returned empty content")
+                    
+                    if isinstance(content, str) and content.strip():
                         try:
                             # Try to parse as JSON
                             parsed = json.loads(content)
@@ -152,6 +195,7 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
                                         elif isinstance(diag_data, CampaignDiagnosis):
                                             updated_diagnoses.append(diag_data)
                                     if updated_diagnoses:
+                                        print(f"[{node_name}] ✓ Successfully extracted {len(updated_diagnoses)} diagnoses from JSON")
                                         updated_diagnoses = updated_diagnoses
                         except (json.JSONDecodeError, TypeError):
                             # Try to extract JSON from text
@@ -168,12 +212,17 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
                                                     updated_diagnoses.append(CampaignDiagnosis(**diag_data))
                                                 elif isinstance(diag_data, CampaignDiagnosis):
                                                     updated_diagnoses.append(diag_data)
-                                except:
-                                    pass
+                                            if updated_diagnoses:
+                                                print(f"[{node_name}] ✓ Successfully extracted {len(updated_diagnoses)} diagnoses from embedded JSON")
+                                except Exception as e:
+                                    print(f"[{node_name}] ⚠️  Failed to parse JSON from content: {e}")
+                                    # Log a snippet of the content for debugging
+                                    if content:
+                                        print(f"           Content preview: {content[:200]}...")
                     
                     updated_messages.append({
                         "role": "assistant",
-                        "content": content
+                        "content": content if content else ""
                     })
                 elif isinstance(msg, ToolMessage):
                     # Extract tool results - look for CampaignBrief from load_and_parse_spreadsheet
