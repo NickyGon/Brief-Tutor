@@ -245,8 +245,17 @@ def parse_campaign_sheet(
                             continue
 
                         value_str = str(value).strip()
-
+                        
+                        # For asset keys, skip empty values and "None" placeholders
                         if key in assets_keys:
+                            # Skip if blank/empty
+                            if not value_str:
+                                continue
+                            
+                            # Skip if it's "None" placeholder (case-insensitive)
+                            if value_str.lower() == "none":
+                                continue
+                            
                             assets_data[key] = value_str
                         elif key in style_keys:
                             style_descriptions_data[key] = value_str
@@ -257,6 +266,14 @@ def parse_campaign_sheet(
                         continue
 
                 # OT 1–6 rows - these are additional assets
+                # Skip blank values and placeholder text
+                placeholder_patterns = [
+                    "choose from dropdown",
+                    "write dimensions",
+                    "choose from dropdown or write dimensions of ot",
+                    "choose from dropdown or write dimensions"
+                ]
+                
                 for key, row_idx in ot_rows.items():
                     try:
                         if row_idx >= df.shape[0]:
@@ -266,7 +283,18 @@ def parse_campaign_sheet(
                         if pd.isna(value):
                             continue
 
-                        assets_data[key] = str(value).strip()
+                        value_str = str(value).strip()
+                        
+                        # Skip if blank or empty
+                        if not value_str:
+                            continue
+                        
+                        # Skip if it matches placeholder patterns (case-insensitive)
+                        value_lower = value_str.lower()
+                        if any(pattern in value_lower for pattern in placeholder_patterns):
+                            continue
+
+                        assets_data[key] = value_str
                     except Exception as e:
                         print(f"[WARN] Error processing OT row '{key}' (index {row_idx}) for campaign '{campaign_id}' in column {col}: {type(e).__name__}: {str(e)}")
                         continue
@@ -342,25 +370,15 @@ def parse_campaign_sheet(
         }, []
 
 
-@tool
-def load_and_parse_spreadsheet(spreadsheet_path: str) -> CampaignBrief:
+def _parse_spreadsheet_internal(spreadsheet_path: str) -> dict:
     """
-    Load the campaign content spreadsheet and normalize it into a structured schema
-    for the brief creator.
-
-    Use this tool when you need to:
-    - Read an Excel spreadsheet with campaign content.
-    - Get a list of campaigns and their attributes.
-    - Prepare data for later asset counting.
-
-    Input:
-    - spreadsheet_path: local path to the .xlsx file.
-
-    Output:
-    - A dict with: task_type, asset_summary, dealership_name, content_11_20, campaigns.
+    Internal function to parse a spreadsheet without the tool wrapper.
+    This can be called directly from other Python code.
+    
+    Returns:
+        A dict with: task_type, asset_summary, dealership_name, content_11_20, campaigns.
     """
-
-    print(f"[Brief Creator] Loading spreadsheet from: {spreadsheet_path}")
+    print(f"[Spreadsheet Parser] Loading spreadsheet from: {spreadsheet_path}")
     xls = pd.ExcelFile(spreadsheet_path)
 
     # First tab: CampaignContent_1_10
@@ -405,7 +423,6 @@ def load_and_parse_spreadsheet(spreadsheet_path: str) -> CampaignBrief:
     result_dict = serialize_pydantic_model(campaign_brief)
     
     # Verify no Pydantic models remain
-    import json
     try:
         json.dumps(result_dict)  # Test if it's JSON serializable
     except TypeError as e:
@@ -414,6 +431,28 @@ def load_and_parse_spreadsheet(spreadsheet_path: str) -> CampaignBrief:
         result_dict = json.loads(campaign_brief.model_dump_json())
     
     return result_dict
+
+
+@tool
+def load_and_parse_spreadsheet(spreadsheet_path: str) -> CampaignBrief:
+    """
+    Load the campaign content spreadsheet and normalize it into a structured schema
+    for the brief creator.
+
+    Use this tool when you need to:
+    - Read an Excel spreadsheet with campaign content.
+    - Get a list of campaigns and their attributes.
+    - Prepare data for later asset counting.
+
+    Input:
+    - spreadsheet_path: local path to the .xlsx file.
+
+    Output:
+    - A dict with: task_type, asset_summary, dealership_name, content_11_20, campaigns.
+    """
+
+    # Use the internal function to do the actual parsing
+    return _parse_spreadsheet_internal(spreadsheet_path)
 
 
 def _get_qdrant_client():
@@ -456,7 +495,14 @@ def _get_qdrant_vectorstore(collection_name: str = None):
     collection_name = collection_name or os.getenv("QDRANT_COLLECTION_NAME", "campaign_documents")
     
     try:
-        embeddings = OpenAIEmbeddings()
+        # Use the same embedding model as ingestion (import from rag_ingestion)
+        try:
+            from rag_ingestion import EMBEDDING_MODEL
+            embedding_model = EMBEDDING_MODEL
+        except ImportError:
+            # Fallback if import fails (shouldn't happen in normal operation)
+            embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
+        embeddings = OpenAIEmbeddings(model=embedding_model)
         vectorstore = Qdrant(
             client=client,
             collection_name=collection_name,
@@ -755,6 +801,541 @@ def retrieve_campaign_briefs(
         return f"Error retrieving campaign briefs: {str(e)}"
 
 
+@tool
+def find_similar_campaigns(
+    task_type: str,
+    dealership_name: Optional[str] = None,
+    asset_summary: Optional[str] = None,
+    top_k: int = 5,
+    collection_name: Optional[str] = None
+) -> str:
+    """
+    Find similar campaign briefs based on metadata filters.
+    This tool searches for campaign briefs in Qdrant using a two-step approach:
+    1. First retrieves campaigns by task_type (with optional semantic search on asset_summary)
+    2. Then optionally filters by dealership_name - if no dealership matches are found, returns the original task_type results
+    
+    Use this tool when you need to:
+    - Find similar campaign briefs for evaluation or comparison
+    - Look up campaigns with the same task type, optionally filtered by dealership
+    - Get references to similar campaigns before fetching their full data
+    
+    Args:
+        task_type: Task type to filter by (e.g., "Theme", "New Creative", "Campaign Update", "Rework")
+        dealership_name: Optional dealership name to filter by. If provided, will filter results by dealership,
+                        but if no matches are found, will return the original task_type results instead.
+        asset_summary: Optional asset summary text for semantic search (e.g., "SL: 5, BN: 3")
+        top_k: Number of most similar briefs to return (default: 5)
+        collection_name: Optional name of the Qdrant collection to search (defaults to env var)
+        
+    Returns:
+        A string containing metadata about similar campaign briefs, including:
+        - File name, task type, dealership, asset summary
+        - Total campaigns and campaign IDs
+        - Google Drive file_id for fetching full data
+    """
+    if not QDRANT_AVAILABLE:
+        return "Error: Qdrant dependencies are not installed."
+    
+    client = _get_qdrant_client()
+    if not client:
+        return "Error: Could not connect to Qdrant vector database."
+    
+    try:
+        collection_name_actual = collection_name or os.getenv("QDRANT_COLLECTION_NAME", "campaign_documents")
+        
+        # Build filter for metadata-based search (task_type only first)
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        
+        # Step 1: Filter by task_type only (and file_type)
+        base_filter_conditions = [
+            FieldCondition(
+                key="file_type",
+                match=MatchValue(value="campaign_metadata")
+            ),
+            FieldCondition(
+                key="task_type",
+                match=MatchValue(value=task_type)
+            )
+        ]
+        
+        base_search_filter = Filter(must=base_filter_conditions)
+        
+        # Step 2: Retrieve campaigns by task_type (with semantic search if asset_summary provided)
+        if asset_summary:
+            # Use vectorstore for embedding the asset_summary query
+            vectorstore = _get_qdrant_vectorstore(collection_name_actual)
+            if vectorstore:
+                query_vector = vectorstore.embeddings.embed_query(asset_summary)
+                
+                # Search with task_type filter only
+                search_results = client.query_points(
+                    collection_name=collection_name_actual,
+                    query=query_vector,
+                    query_filter=base_search_filter,
+                    limit=top_k * 2,  # Get more results to allow for dealership filtering
+                    with_payload=True
+                )
+            else:
+                # Fallback: scroll with filter only (no semantic search)
+                search_results = client.scroll(
+                    collection_name=collection_name_actual,
+                    scroll_filter=base_search_filter,
+                    limit=top_k * 2,
+                    with_payload=True
+                )
+        else:
+            # No semantic search, just filter-based retrieval by task_type
+            search_results = client.scroll(
+                collection_name=collection_name_actual,
+                scroll_filter=base_search_filter,
+                limit=top_k * 2,
+                with_payload=True
+            )
+        
+        # Extract points from the response
+        if hasattr(search_results, 'points'):
+            points = search_results.points
+        elif isinstance(search_results, tuple):
+            points, _ = search_results
+        else:
+            points = []
+        
+        if not points:
+            return f"No similar campaign briefs found matching task_type='{task_type}'"
+        
+        # Step 3: If dealership_name is provided, filter results by dealership
+        # If no results match dealership, use the original results
+        original_points = points
+        if dealership_name:
+            filtered_points = [
+                point for point in points
+                if point.payload and point.payload.get('dealership_name') == dealership_name
+            ]
+            
+            # If dealership filter found results, use them; otherwise use original
+            if filtered_points:
+                points = filtered_points[:top_k]  # Limit to top_k
+            else:
+                # No matches for dealership, use original results
+                points = original_points[:top_k]
+        else:
+            # No dealership filter, just limit to top_k
+            points = points[:top_k]
+        
+        # Format the results
+        results = []
+        for i, point in enumerate(points, 1):
+            payload = point.payload or {}
+            
+            brief_info = []
+            brief_info.append(f"Similar Campaign Brief {i}:")
+            brief_info.append(f"  File Name: {payload.get('file_name', 'Unknown')}")
+            brief_info.append(f"  File ID (Google Drive): {payload.get('file_id', 'Unknown')}")
+            brief_info.append(f"  Task Type: {payload.get('task_type', 'Unknown')}")
+            brief_info.append(f"  Dealership: {payload.get('dealership_name', 'Unknown')}")
+            brief_info.append(f"  Asset Summary: {payload.get('asset_summary', 'N/A')}")
+            brief_info.append(f"  Total Campaigns: {payload.get('total_campaigns', 0)}")
+            
+            campaign_ids = payload.get('campaign_ids', [])
+            if campaign_ids:
+                brief_info.append(f"  Campaign IDs: {', '.join(campaign_ids[:10])}")
+                if len(campaign_ids) > 10:
+                    brief_info.append(f"    ... and {len(campaign_ids) - 10} more")
+            
+            brief_info.append(f"  Folder Path: {payload.get('folder_path', 'N/A')}")
+            brief_info.append(f"  Modified: {payload.get('file_modified_time', 'Unknown')}")
+            brief_info.append("")
+            brief_info.append("  Use fetch_campaign_brief_from_drive(file_id) to get full campaign data.")
+            
+            results.append("\n".join(brief_info))
+        
+        return "\n---\n".join(results)
+    
+    except Exception as e:
+        return f"Error finding similar campaigns: {str(e)}"
+
+
+@tool
+def fetch_campaign_brief_from_drive(file_id: str) -> str:
+    """
+    Fetch full campaign brief data from Google Drive using file_id.
+    This tool downloads the spreadsheet from Google Drive, parses it, and returns
+    the complete CampaignBrief JSON with all campaign details.
+    
+    Use this tool when you need to:
+    - Get full campaign data after finding similar campaigns with find_similar_campaigns()
+    - Retrieve complete campaign details for evaluation or comparison
+    - Access all campaign information that isn't stored in Qdrant metadata
+    
+    Args:
+        file_id: Google Drive file ID of the campaign brief spreadsheet
+        
+    Returns:
+        A JSON string containing the full CampaignBrief structure with all campaigns,
+        including offer details, assets, style descriptions, etc.
+    """
+    try:
+        # Import Google Drive helpers from rag_ingestion
+        import sys
+        from pathlib import Path
+        project_root = Path(__file__).parent.parent
+        if str(project_root) not in sys.path:
+            sys.path.insert(0, str(project_root))
+        
+        from rag_ingestion import get_drive_service, download_file_content
+        import tempfile
+        
+        # Get Google Drive service
+        drive_service = get_drive_service()
+        
+        # Download the file
+        content = download_file_content(drive_service, file_id, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        
+        # Save to temporary file and parse
+        temp_file = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='wb', suffix='.xlsx', delete=False) as tmp:
+                tmp.write(content)
+                temp_file = tmp.name
+            
+            # Use _parse_spreadsheet_internal to get full campaign data (not the tool wrapper)
+            campaign_brief = _parse_spreadsheet_internal(temp_file)
+            
+            # Return as JSON string
+            return json.dumps(campaign_brief, indent=2)
+        
+        finally:
+            # Clean up temporary file
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.unlink(temp_file)
+                except Exception:
+                    pass
+    
+    except Exception as e:
+        return f"Error fetching campaign brief from Google Drive (file_id={file_id}): {str(e)}"
+
+
+@tool
+def identify_previous_campaign_id(
+    collection_name: Optional[str] = None,
+    top_k: int = 10
+) -> str:
+    """
+    Identify the previous campaign ID that all campaigns in a Campaign Update brief should reference.
+    This tool retrieves RAG documentation about Campaign Update rules and extracts the previous campaign ID pattern.
+    
+    Use this tool FIRST when evaluating Campaign Update campaigns to identify the previous campaign ID
+    (e.g., "A-12345678") that all campaigns should reference according to the rules.
+    
+    This tool is specifically for Campaign Update agents and should be called before evaluating campaigns.
+    
+    IMPORTANT: If this tool returns an ERROR, the agent must stop evaluation and report the error.
+    The previous campaign ID is required for Campaign Update evaluation and cannot be skipped.
+    
+    Args:
+        collection_name: Optional name of the Qdrant collection to search (defaults to env var)
+        top_k: Number of documents to retrieve for searching (default: 10, increased to find the ID)
+        
+    Returns:
+        The previous campaign ID in the format "A-XXXXXXXX" or similar pattern found in the rules.
+        Returns an ERROR message if the previous campaign ID cannot be found in the RAG documentation.
+    """
+    if not QDRANT_AVAILABLE:
+        return "Error: Qdrant dependencies are not installed."
+    
+    try:
+        # Use retrieve_rag_information to get Campaign Update rules
+        rag_result = retrieve_rag_information(
+            query="Campaign Update previous campaign ID format pattern A-12345678 how to identify",
+            collection_name=collection_name,
+            file_type="document",
+            top_k=top_k
+        )
+        
+        if "Error" in rag_result:
+            raise ValueError(f"Failed to retrieve RAG information: {rag_result}")
+        
+        # Search for campaign ID patterns in the retrieved text
+        # Pattern: A- followed by 8 digits (e.g., A-12345678)
+        import re
+        
+        # Look for patterns like "A-12345678" or "A-XXXXXXXX" or similar
+        patterns = [
+            r'A-\d{8}',  # A-12345678
+            r'A-\d{7,9}',  # A-1234567 or A-123456789 (flexible)
+            r'[A-Z]-\d{7,9}',  # Any letter followed by dash and digits
+        ]
+        
+        found_ids = []
+        for pattern in patterns:
+            matches = re.findall(pattern, rag_result, re.IGNORECASE)
+            if matches:
+                found_ids.extend(matches)
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_ids = []
+        for id_val in found_ids:
+            if id_val.upper() not in seen:
+                seen.add(id_val.upper())
+                unique_ids.append(id_val)
+        
+        if not unique_ids:
+            # Return a clear error message that the agent can recognize
+            return (
+                f"ERROR: Previous campaign ID not found in RAG documentation.\n\n"
+                f"Retrieved RAG information preview:\n{rag_result[:500]}...\n\n"
+                f"CRITICAL: The previous campaign ID (format: A-12345678) could not be identified from the RAG rules.\n"
+                f"This is required for Campaign Update evaluation. Please ensure:\n"
+                f"1. The Campaign Update documentation contains the previous campaign ID pattern\n"
+                f"2. The ID format matches patterns like 'A-12345678' or similar\n"
+                f"3. The documentation is properly indexed in the RAG collection\n\n"
+                f"Evaluation cannot proceed without identifying the previous campaign ID."
+            )
+        
+        # If multiple IDs found, use the most common one or the first one
+        # Typically there should be one consistent ID
+        previous_campaign_id = unique_ids[0]
+        
+        if len(unique_ids) > 1:
+            # Warn if multiple IDs found, but return the first one
+            return (
+                f"WARNING: Multiple campaign ID patterns found: {', '.join(unique_ids)}\n"
+                f"Using: {previous_campaign_id}\n\n"
+                f"Previous Campaign ID: {previous_campaign_id}"
+            )
+        
+        return f"Previous Campaign ID identified: {previous_campaign_id}"
+    
+    except ValueError as e:
+        # Re-raise ValueError (our custom error)
+        raise e
+    except Exception as e:
+        return f"Error identifying previous campaign ID: {str(e)}"
+
+
+@tool
+def find_and_load_previous_campaign_brief(
+    previous_campaign_id: str,
+    search_directory: Optional[str] = None
+) -> str:
+    """
+    Find a campaign brief file locally that contains the previous campaign ID in its filename,
+    then load and parse it to create a campaign brief.
+    
+    This tool searches for spreadsheet files (.xlsx) in the local filesystem that have the previous campaign ID
+    (e.g., "A-12345678") in their filename, and parses it into a campaign brief.
+    
+    Use this tool after identifying the previous campaign ID to load the original campaign brief
+    that the Campaign Update campaigns are referencing.
+    
+    Args:
+        previous_campaign_id: The previous campaign ID to search for (e.g., "A-12345678")
+        search_directory: Optional local directory path to search in. If not provided, searches
+                         in the current working directory.
+        
+    Returns:
+        A JSON string containing the full CampaignBrief structure with all campaigns from the
+        previous campaign brief file. Returns an error if the file cannot be found or parsed.
+    """
+    try:
+        from pathlib import Path
+        import glob
+        
+        # Determine search directory
+        if search_directory:
+            search_path = Path(search_directory)
+            # Resolve relative paths to absolute paths
+            if not search_path.is_absolute():
+                search_path = Path.cwd() / search_path
+            search_path = search_path.resolve()
+            
+            if not search_path.exists():
+                return (
+                    f"ERROR: Search directory does not exist: {search_path}\n"
+                    f"Previous Campaign ID: {previous_campaign_id}"
+                )
+            if not search_path.is_dir():
+                return (
+                    f"ERROR: Search path is not a directory: {search_path}\n"
+                    f"Previous Campaign ID: {previous_campaign_id}"
+                )
+        else:
+            # Default to current working directory (where Python script is run from)
+            search_path = Path.cwd().resolve()
+        
+        # Search for .xlsx files in the directory (recursively)
+        xlsx_pattern = str(search_path / "**" / "*.xlsx")
+        all_files = glob.glob(xlsx_pattern, recursive=True)
+        
+        if not all_files:
+            return (
+                f"ERROR: No .xlsx files found in search directory.\n"
+                f"Directory: {search_path}\n"
+                f"Previous Campaign ID: {previous_campaign_id}"
+            )
+        
+        # Find file(s) containing the previous campaign ID in the filename
+        matching_files = [
+            f for f in all_files
+            if previous_campaign_id.upper() in Path(f).name.upper()
+        ]
+        
+        if not matching_files:
+            # Show some example filenames for debugging
+            example_files = [Path(f).name for f in all_files[:5]]
+            return (
+                f"ERROR: No file found containing previous campaign ID '{previous_campaign_id}' in filename.\n"
+                f"Searched in directory: {search_path}\n"
+                f"Found {len(all_files)} .xlsx file(s) but none match the campaign ID.\n"
+                f"Example files: {example_files}"
+            )
+        
+        # Use the first matching file (or most recent if multiple)
+        if len(matching_files) > 1:
+            # Sort by modification time, most recent first
+            matching_files.sort(key=lambda f: Path(f).stat().st_mtime, reverse=True)
+        
+        target_file = matching_files[0]
+        file_name = Path(target_file).name
+        
+        print(f"[Previous Campaign] Found file: {file_name} (path={target_file})")
+        
+        # Parse the spreadsheet into a campaign brief
+        campaign_brief = _parse_spreadsheet_internal(target_file)
+        
+        # Return as JSON string
+        return json.dumps(campaign_brief, indent=2)
+    
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        return (
+            f"Error finding and loading previous campaign brief (ID: {previous_campaign_id}): {str(e)}\n"
+            f"Details: {error_details}"
+        )
+
+
+@tool
+def match_campaigns_by_headline(
+    current_campaign_brief_json: str,
+    previous_campaign_brief_json: str
+) -> str:
+    """
+    Match campaigns between the current campaign brief (A) and the previous campaign brief (B) by their headline.
+    
+    This tool compares campaigns from both briefs and creates a filtered set of matching campaigns based on
+    their headline text (case-insensitive, trimmed). This should be used after loading the previous campaign brief
+    to identify which campaigns in the current brief correspond to which campaigns in the previous brief.
+    
+    Args:
+        current_campaign_brief_json: JSON string of the current campaign brief (brief A) being processed
+        previous_campaign_brief_json: JSON string of the previous campaign brief (brief B) loaded from the campaign ID
+        
+    Returns:
+        A JSON string containing:
+        - matched_campaigns: List of matched campaign pairs with current and previous campaign data
+        - unmatched_current: List of campaigns from current brief that had no match
+        - unmatched_previous: List of campaigns from previous brief that had no match
+        - summary: Statistics about the matching process
+    """
+    try:
+        import json
+        from typing import Dict, List, Any
+        
+        # Parse both briefs
+        current_brief = json.loads(current_campaign_brief_json) if isinstance(current_campaign_brief_json, str) else current_campaign_brief_json
+        previous_brief = json.loads(previous_campaign_brief_json) if isinstance(previous_campaign_brief_json, str) else previous_campaign_brief_json
+        
+        current_campaigns = current_brief.get("campaigns", [])
+        previous_campaigns = previous_brief.get("campaigns", [])
+        
+        # Normalize headline for comparison (case-insensitive, trimmed)
+        def normalize_headline(headline: str) -> str:
+            if not headline:
+                return ""
+            return headline.strip().lower()
+        
+        # Build a map of normalized headline -> list of previous campaigns (in case of duplicates)
+        previous_headline_map: Dict[str, List[Dict[str, Any]]] = {}
+        for prev_campaign in previous_campaigns:
+            headline = prev_campaign.get("offer_details", {}).get("headline", "")
+            normalized = normalize_headline(headline)
+            if normalized:
+                if normalized not in previous_headline_map:
+                    previous_headline_map[normalized] = []
+                previous_headline_map[normalized].append(prev_campaign)
+        
+        # Match current campaigns with previous campaigns
+        matched_campaigns: List[Dict[str, Any]] = []
+        matched_previous_indices = set()
+        
+        for curr_campaign in current_campaigns:
+            curr_headline = curr_campaign.get("offer_details", {}).get("headline", "")
+            normalized_curr = normalize_headline(curr_headline)
+            
+            if normalized_curr and normalized_curr in previous_headline_map:
+                # Found a match - use the first available previous campaign with this headline
+                for prev_campaign in previous_headline_map[normalized_curr]:
+                    prev_campaign_id = prev_campaign.get("campaign_id", "")
+                    # Check if we haven't already matched this previous campaign
+                    if prev_campaign not in [m.get("previous_campaign") for m in matched_campaigns]:
+                        matched_campaigns.append({
+                            "current_campaign": curr_campaign,
+                            "previous_campaign": prev_campaign,
+                            "headline": curr_headline,  # Original headline (not normalized)
+                            "match_type": "headline"
+                        })
+                        break
+            else:
+                # No match found for this current campaign
+                pass
+        
+        # Find unmatched campaigns
+        matched_previous_ids = {m["previous_campaign"].get("campaign_id", "") for m in matched_campaigns}
+        unmatched_current = [
+            curr for curr in current_campaigns
+            if normalize_headline(curr.get("offer_details", {}).get("headline", "")) not in previous_headline_map
+        ]
+        unmatched_previous = [
+            prev for prev in previous_campaigns
+            if prev.get("campaign_id", "") not in matched_previous_ids
+        ]
+        
+        # Create summary
+        summary = {
+            "total_current_campaigns": len(current_campaigns),
+            "total_previous_campaigns": len(previous_campaigns),
+            "matched_count": len(matched_campaigns),
+            "unmatched_current_count": len(unmatched_current),
+            "unmatched_previous_count": len(unmatched_previous),
+            "match_rate": f"{len(matched_campaigns) / len(current_campaigns) * 100:.1f}%" if current_campaigns else "0%"
+        }
+        
+        result = {
+            "matched_campaigns": matched_campaigns,
+            "unmatched_current": unmatched_current,
+            "unmatched_previous": unmatched_previous,
+            "summary": summary
+        }
+        
+        print(f"[Campaign Matching] Matched {len(matched_campaigns)} campaigns by headline")
+        print(f"  Current campaigns: {len(current_campaigns)}, Previous campaigns: {len(previous_campaigns)}")
+        print(f"  Unmatched current: {len(unmatched_current)}, Unmatched previous: {len(unmatched_previous)}")
+        
+        return json.dumps(result, indent=2)
+    
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        return (
+            f"Error matching campaigns by headline: {str(e)}\n"
+            f"Details: {error_details}"
+        )
+
+
 def get_available_tools(agent_name: Optional[str] = None) -> list:
     """
     Returns a list of available tools for a specific agent.
@@ -770,19 +1351,29 @@ def get_available_tools(agent_name: Optional[str] = None) -> list:
     # Base tool that all agents should have
     base_tools = [load_and_parse_spreadsheet]
     
-    # RAG tool for agents that need document guidance (rules/guidelines only)
+    # RAG tools for agents that need document guidance + similar campaign search
     # Note: task-specific agents should NOT have load_and_parse_spreadsheet to prevent reloading
-    rag_tools = [retrieve_rag_information]
+    rag_tools = [retrieve_rag_information, find_similar_campaigns, fetch_campaign_brief_from_drive]
+    
+    # Campaign Update agent needs additional tools to identify and load previous campaign ID
+    campaign_update_tools = [
+        retrieve_rag_information,
+        find_similar_campaigns,
+        fetch_campaign_brief_from_drive,
+        identify_previous_campaign_id,
+        find_and_load_previous_campaign_brief,
+        match_campaigns_by_headline
+    ]
     
     # RAG tools including campaign brief retrieval (for QA validation)
-    rag_tools_with_briefs = [load_and_parse_spreadsheet, retrieve_rag_information, retrieve_campaign_briefs]
+    rag_tools_with_briefs = [load_and_parse_spreadsheet, retrieve_rag_information, retrieve_campaign_briefs, find_similar_campaigns, fetch_campaign_brief_from_drive]
     
     # Define tool sets for each agent
     agent_tool_map = {
         "brief_creator": base_tools,
-        "theme_agent": rag_tools,  # Has RAG access for rules only
-        "new_creative_agent": rag_tools,  # Has RAG access for rules only
-        "campaign_update_agent": rag_tools,  # Has RAG access for rules only
+        "theme_agent": rag_tools,  # Has RAG access for rules + similar campaign search
+        "new_creative_agent": rag_tools,  # Has RAG access for rules + similar campaign search
+        "campaign_update_agent": campaign_update_tools,  # Has RAG access + previous campaign ID identification
         "qa_agent": rag_tools_with_briefs,  # Has RAG access for QA rules + campaign brief retrieval for validation
     }
     

@@ -8,15 +8,49 @@ prompt: |
 
     Your responsibilities:
     1. The campaign brief is already provided in the workflow state/messages. DO NOT call `load_and_parse_spreadsheet` - use the campaign brief data that is already available.
-    2. Given the campaign brief from the state, take the list of campaigns it has.
-    3. ALWAYS use the `retrieve_rag_information` tool with:
+    2. Given the campaign brief from the state, take the list of campaigns it has and extract metadata:
+       - task_type (should be "Campaign Update" or "Rework")
+       - dealership_name
+       - asset_summary
+    3. FIRST, you MUST use the `identify_previous_campaign_id` tool to identify the previous campaign ID:
+       - This tool will retrieve RAG documentation and extract the previous campaign ID pattern (e.g., "A-12345678")
+       - The previous campaign ID should be consistent across all campaigns in the brief
+       - If the tool cannot find the previous campaign ID, it will return an error - you MUST report this error and stop evaluation
+       - Store this previous campaign ID - it will be needed for all subsequent evaluations
+    3a. AFTER identifying the previous campaign ID, use the `find_and_load_previous_campaign_brief` tool:
+       - Pass the identified previous campaign ID to this tool
+       - This tool will search locally for a file containing that ID in its filename
+       - It will parse that file to create a campaign brief
+       - Store this previous campaign brief - it contains the original campaigns that the current campaigns are updating
+       - If the file cannot be found, the tool will return an error - you MUST report this error
+       - Optionally provide a search_directory parameter if the file is in a specific location
+    3b. AFTER loading the previous campaign brief, use the `match_campaigns_by_headline` tool:
+       - Pass the current campaign brief (from the workflow state) and the previous campaign brief (from step 3a)
+       - This tool will match campaigns between the current brief (A) and previous brief (B) by comparing their headline text
+       - Store the matched campaigns result - this contains matched pairs, unmatched campaigns, and a summary
+       - The matched campaigns will be used for comparison during evaluation
+       - Note: Campaigns are matched case-insensitively by their headline text
+    4. ALWAYS use the `retrieve_rag_information` tool with:
        - query: A query about "rules for evaluating campaigns in a Campaign Update or Rework Task Type" or "guidelines for evaluating campaigns in a Campaign Update Task Type" to retrieve relevant information
        - collection_name: "my_rag_collection"
+       - file_type: "document" (to get only documentation, not campaign briefs)
        - top_k: 5 (or as needed)
-    4. Use the retrieved RAG information to understand the rules and guidelines for evaluating the given campaigns from the campaign brief's campaign list.
-    5. Evaluate each campaign in the campaign list according to the rules retrieved from the RAG tool.
-    6. Return a list of diagnoses for each campaign in the campaign list.
-    7. You MUST return your final response as a valid JSON object with the following exact structure:
+    5. Use the `find_similar_campaigns` tool to find similar campaign briefs:
+       - task_type: Use the task_type from the current brief
+       - dealership_name: Optionally use the dealership_name from the current brief (if you want to compare with same dealership)
+       - asset_summary: Optionally use the asset_summary for semantic matching
+       - top_k: 3-5 similar briefs
+    6. Optionally use `fetch_campaign_brief_from_drive` to get full data from similar campaigns if needed for detailed comparison.
+    7. Use the retrieved RAG information (guidelines), the identified previous campaign ID from step 3, the previous campaign brief from step 3a, the matched campaigns from step 3b, and similar campaign examples to understand how to evaluate the given campaigns.
+    8. Evaluate each campaign in the campaign list according to the rules retrieved from the RAG tool, comparing against the matched previous campaigns from step 3b and ensuring you reference the previous campaign ID where applicable.
+       - For matched campaigns: Compare the current campaign with its matched previous campaign
+       - For unmatched campaigns: Note that they don't have a corresponding previous campaign to compare against
+    9. Return a list of diagnoses for each campaign in the campaign list.
+    10. You MUST use the correct status values:
+       - "passed": Use when the campaign has NO issues and complies with all rules. If issues array is empty, status MUST be "passed".
+       - "observed": Use when the campaign has minor issues or recommendations but no critical problems that prevent it from being used.
+       - "critical": Use when the campaign has serious issues that must be fixed before it can be used.
+    11. You MUST return your final response as a valid JSON object with the following exact structure:
        {
          "campaign_diagnoses": [
            {
@@ -34,7 +68,14 @@ prompt: |
     Rules:
       - NEVER call `load_and_parse_spreadsheet` - the campaign brief is already loaded in the workflow state.
       - Use the campaign brief data provided in the messages/state.
-      - Never assume data not provided by the campaign list or the RAG tool's retrieved information.
+      - CRITICAL: You MUST call `identify_previous_campaign_id` FIRST before any other evaluation steps.
+      - If `identify_previous_campaign_id` returns an "ERROR:" message, you MUST stop evaluation and return an error response indicating that the previous campaign ID could not be identified.
+      - After loading the previous campaign brief, you MUST call `match_campaigns_by_headline` to match campaigns between current and previous briefs before using RAG.
+      - Use the matched campaigns from `match_campaigns_by_headline` for comparison during evaluation - matched campaigns should be compared against their previous versions, unmatched campaigns should be noted as new.
+      - Use `retrieve_rag_information` with file_type="document" to get only documentation/guidelines (not campaign briefs).
+      - Use `find_similar_campaigns` to find similar campaign briefs for comparison.
+      - Optionally use `fetch_campaign_brief_from_drive` to get full data from similar campaigns if needed.
+      - Never assume data not provided by the campaign list, RAG tool, or similar campaigns.
       - If the campaign list is empty, return an error message.
       - If the RAG tool's retrieved information is empty, return an error message.
     
@@ -44,6 +85,7 @@ tools:
       description: >
         Retrieve relevant information from documents stored in Qdrant vector database.
         Use this tool to get rules and guidelines for evaluating campaigns in a Campaign Update or Rework Task Type.
+        Set file_type="document" to retrieve only documentation (PDFs), not campaign briefs.
       input_schema:
         type: object
         properties:
@@ -53,11 +95,97 @@ tools:
           collection_name:
             type: string
             description: "Name of the Qdrant collection to search (should be \"my_rag_collection\")"
+          file_type:
+            type: string
+            description: "Filter by file type. Use 'document' for documentation only, or 'campaign_metadata' for campaign briefs."
           top_k:
             type: integer
             description: "Number of most relevant documents to retrieve (default: 5)"
         required: [query]
+        optional: [collection_name, file_type, top_k]
+    - name: find_similar_campaigns
+      description: >
+        Find similar campaign briefs based on metadata filters (task_type, dealership, asset_summary).
+        Returns metadata with Google Drive file IDs for fetching full data.
+      input_schema:
+        type: object
+        properties:
+          task_type:
+            type: string
+            description: "Task type to filter by (e.g., 'New Creative', 'Theme', 'Campaign Update')"
+          dealership_name:
+            type: string
+            description: "Optional dealership name to filter by"
+          asset_summary:
+            type: string
+            description: "Optional asset summary for semantic search (e.g., 'SL: 5, BN: 3')"
+          top_k:
+            type: integer
+            description: "Number of most similar briefs to return (default: 5)"
+          collection_name:
+            type: string
+            description: "Name of the Qdrant collection to search (should be 'my_rag_collection')"
+        required: [task_type]
+        optional: [dealership_name, asset_summary, top_k, collection_name]
+    - name: fetch_campaign_brief_from_drive
+      description: >
+        Fetch full campaign brief data from Google Drive using file_id.
+        Use this after find_similar_campaigns to get complete campaign details for comparison.
+      input_schema:
+        type: object
+        properties:
+          file_id:
+            type: string
+            description: "Google Drive file ID of the campaign brief spreadsheet"
+        required: [file_id]
+    - name: identify_previous_campaign_id
+      description: >
+        Identify the previous campaign ID that all campaigns in a Campaign Update brief should reference.
+        This tool retrieves RAG documentation and extracts the previous campaign ID pattern (e.g., "A-12345678").
+        MUST be called FIRST before evaluating campaigns. Returns an error if the previous campaign ID cannot be found.
+      input_schema:
+        type: object
+        properties:
+          collection_name:
+            type: string
+            description: "Name of the Qdrant collection to search (should be 'my_rag_collection')"
+          top_k:
+            type: integer
+            description: "Number of documents to retrieve for searching (default: 10)"
+        required: []
         optional: [collection_name, top_k]
+    - name: find_and_load_previous_campaign_brief
+      description: >
+        Find a campaign brief file locally that contains the previous campaign ID in its filename,
+        then load and parse it to create a campaign brief. Use this after identifying the previous campaign ID
+        to load the original campaign brief that the current campaigns are updating.
+      input_schema:
+        type: object
+        properties:
+          previous_campaign_id:
+            type: string
+            description: "The previous campaign ID to search for (e.g., 'A-12345678')"
+          search_directory:
+            type: string
+            description: "Optional local directory path to search in. If not provided, searches in the current working directory."
+        required: [previous_campaign_id]
+        optional: [search_directory]
+    - name: match_campaigns_by_headline
+      description: >
+        Match campaigns between the current campaign brief (A) and the previous campaign brief (B) by their headline.
+        This tool compares campaigns from both briefs and creates a filtered set of matching campaigns based on
+        their headline text (case-insensitive). Use this after loading the previous campaign brief to identify
+        which campaigns in the current brief correspond to which campaigns in the previous brief.
+      input_schema:
+        type: object
+        properties:
+          current_campaign_brief_json:
+            type: string
+            description: "JSON string of the current campaign brief (brief A) being processed. You can get this from the workflow state/messages."
+          previous_campaign_brief_json:
+            type: string
+            description: "JSON string of the previous campaign brief (brief B) returned from find_and_load_previous_campaign_brief tool."
+        required: [current_campaign_brief_json, previous_campaign_brief_json]
 
 inputs:
     campaign_brief:
@@ -80,7 +208,7 @@ outputs:
               description: "The identifier of the campaign"
             status:
               type: string
-              description: "The status of the campaign evaluation - must be one of: \"critical\", \"observed\", or \"passed\""
+              description: "The status of the campaign evaluation. MUST be \"passed\" if no issues found, \"observed\" for minor issues, or \"critical\" for serious issues. Never use \"ok\" or other values."
               enum: ["critical", "observed", "passed"]
             diagnosis:
               type: string

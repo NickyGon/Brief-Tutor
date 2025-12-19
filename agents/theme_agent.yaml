@@ -9,15 +9,29 @@ prompt: |
 
     Your responsibilities:
     1. The campaign brief is already provided in the workflow state/messages. DO NOT call `load_and_parse_spreadsheet` - use the campaign brief data that is already available.
-    2. Given the campaign brief from the state, take the list of campaigns it has.
+    2. Given the campaign brief from the state, take the list of campaigns it has and extract metadata:
+       - task_type (should be "Theme")
+       - dealership_name
+       - asset_summary
     3. ALWAYS use the `retrieve_rag_information` tool with:
        - query: A query about "rules for evaluating campaigns in a Theme Task Type" or "guidelines for evaluating campaigns in a Theme Task Type" to retrieve relevant information
        - collection_name: "my_rag_collection"
+       - file_type: "document" (to get only documentation, not campaign briefs)
        - top_k: 5 (or as needed)
-    4. Use the retrieved RAG information to understand the rules and guidelines for evaluating the given campaigns from the campaign brief's campaign list.
-    5. Evaluate each campaign in the campaign list according to the rules retrieved from the RAG tool.
-    6. Return a list of diagnoses for each campaign in the campaign list.
-    7. You MUST return your final response as a valid JSON object with the following exact structure:
+    4. Use the `find_similar_campaigns` tool to find similar campaign briefs:
+       - task_type: Use the task_type from the current brief
+       - dealership_name: Optionally use the dealership_name from the current brief (if you want to compare with same dealership)
+       - asset_summary: Optionally use the asset_summary for semantic matching
+       - top_k: 3-5 similar briefs
+    5. Optionally use `fetch_campaign_brief_from_drive` to get full data from similar campaigns if needed for detailed comparison.
+    6. Use the retrieved RAG information (guidelines) and similar campaign examples to understand how to evaluate the given campaigns.
+    7. Evaluate each campaign in the campaign list according to the rules retrieved from the RAG tool and compare against similar campaigns.
+    8. Return a list of diagnoses for each campaign in the campaign list.
+    9. You MUST use the correct status values:
+       - "passed": Use when the campaign has NO issues and complies with all rules. If issues array is empty, status MUST be "passed".
+       - "observed": Use when the campaign has minor issues or recommendations but no critical problems that prevent it from being used.
+       - "critical": Use when the campaign has serious issues that must be fixed before it can be used.
+    10. You MUST return your final response as a valid JSON object with the following exact structure:
        {
          "campaign_diagnoses": [
            {
@@ -35,7 +49,10 @@ prompt: |
     Rules:
       - NEVER call `load_and_parse_spreadsheet` - the campaign brief is already loaded in the workflow state.
       - Use the campaign brief data provided in the messages/state.
-      - Never assume data not provided by the campaign list or the RAG tool's retrieved information.
+      - Use `retrieve_rag_information` with file_type="document" to get only documentation/guidelines (not campaign briefs).
+      - Use `find_similar_campaigns` to find similar campaign briefs for comparison.
+      - Optionally use `fetch_campaign_brief_from_drive` to get full data from similar campaigns if needed.
+      - Never assume data not provided by the campaign list, RAG tool, or similar campaigns.
       - If the campaign list is empty, return an error message.
       - If the RAG tool's retrieved information is empty, return an error message.
 
@@ -45,6 +62,7 @@ tools:
       description: >
         Retrieve relevant information from documents stored in Qdrant vector database.
         Use this tool to get rules and guidelines for evaluating campaigns in a Theme Task Type.
+        Set file_type="document" to retrieve only documentation (PDFs), not campaign briefs.
       input_schema:
         type: object
         properties:
@@ -54,11 +72,49 @@ tools:
           collection_name:  
             type: string
             description: "Name of the Qdrant collection to search (should be \"my_rag_collection\")"
+          file_type:
+            type: string
+            description: "Filter by file type. Use 'document' for documentation only, or 'campaign_metadata' for campaign briefs."
           top_k:
             type: integer
             description: "Number of most relevant documents to retrieve (default: 5)"
         required: [query]
-        optional: [collection_name, top_k]
+        optional: [collection_name, file_type, top_k]
+    - name: find_similar_campaigns
+      description: >
+        Find similar campaign briefs based on metadata filters (task_type, dealership, asset_summary).
+        Returns metadata with Google Drive file IDs for fetching full data.
+      input_schema:
+        type: object
+        properties:
+          task_type:
+            type: string
+            description: "Task type to filter by (e.g., 'New Creative', 'Theme', 'Campaign Update')"
+          dealership_name:
+            type: string
+            description: "Optional dealership name to filter by"
+          asset_summary:
+            type: string
+            description: "Optional asset summary for semantic search (e.g., 'SL: 5, BN: 3')"
+          top_k:
+            type: integer
+            description: "Number of most similar briefs to return (default: 5)"
+          collection_name:
+            type: string
+            description: "Name of the Qdrant collection to search (should be 'my_rag_collection')"
+        required: [task_type]
+        optional: [dealership_name, asset_summary, top_k, collection_name]
+    - name: fetch_campaign_brief_from_drive
+      description: >
+        Fetch full campaign brief data from Google Drive using file_id.
+        Use this after find_similar_campaigns to get complete campaign details for comparison.
+      input_schema:
+        type: object
+        properties:
+          file_id:
+            type: string
+            description: "Google Drive file ID of the campaign brief spreadsheet"
+        required: [file_id]
 
 inputs:
     campaign_brief:
@@ -81,7 +137,7 @@ outputs:
               description: "The identifier of the campaign"
             status:
               type: string
-              description: "The status of the campaign evaluation - must be one of: \"critical\", \"observed\", or \"passed\""
+              description: "The status of the campaign evaluation. MUST be \"passed\" if no issues found, \"observed\" for minor issues, or \"critical\" for serious issues. Never use \"ok\" or other values."
               enum: ["critical", "observed", "passed"]
             diagnosis:
               type: string

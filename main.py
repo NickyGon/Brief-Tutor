@@ -30,7 +30,7 @@ def main():
     print("[Setup] Workflow created successfully!")
     
     # Get spreadsheet path
-    spreadsheet_path = "2025-12-novakgroup-A-25605547.xlsx"  # User will add the path here
+    spreadsheet_path = "2025-12-putnamfordfd-A-25651611.xlsx"  # User will add the path here
     
     if not spreadsheet_path:
         print("\n⚠️  WARNING: spreadsheet_path is not set!")

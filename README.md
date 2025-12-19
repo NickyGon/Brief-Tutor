@@ -1,7 +1,6 @@
 # Brief Tutor - A Creative Campaign Brief Grooming workflow
 
-A LangGraph agent workflow structure designed to evaluate Campaign Brief spreadsheets from DropBox and give
-both diagnostics of the promotional campaigns it contains and suggested updated versions for the COX DDC MS Grooming team to use.
+A LangGraph agent workflow structure designed to evaluate Campaign Brief spreadsheets from DropBox and give both diagnostics of the promotional campaigns it contains and suggested updated versions for the COX DDC MS Grooming team to use.
 
 ## Project Structure
 
@@ -14,8 +13,11 @@ both diagnostics of the promotional campaigns it contains and suggested updated 
 │   ├── tools.py      # Agent tools definitions
 │   └── workflow.py   # Main LangGraph workflow
 ├── requirements.txt  # Python dependencies
-└── README.md        # This file
+├── credentials/      # Credentials folder (has to be created locally)
+│   ├── models.py     # Google service account JSON (has to allow Google Drive API)
+└── README.md
 ```
+
 
 ## Setup
 
@@ -24,19 +26,20 @@ both diagnostics of the promotional campaigns it contains and suggested updated 
 pip install -r requirements.txt
 ```
 
-2. Set up your environment variables:
+2. Setting up environment variables:
    - Copy `.env.example` to `.env`
-   - Fill in your API keys and configuration:
+   - Fill in the needed API keys and configuration:
    ```bash
    cp .env.example .env
    ```
-   Then edit `.env` with your actual values:
+   Then edit `.env` with the actual values:
    ```
    OPENAI_API_KEY=your_api_key_here
-   QDRANT_HOST=localhost
-   QDRANT_PORT=6333
-   QDRANT_API_KEY=your_qdrant_api_key_here  # Optional
-   QDRANT_COLLECTION_NAME=my_rag_collection  # Optional
+   QDRANT_URL=https://your-cluster-id.qdrant.io  # Qdrant Cloud URL
+   QDRANT_API_KEY=your_qdrant_api_key_here  # Required for Qdrant Cloud
+   QDRANT_COLLECTION_NAME=my_rag_collection  # Optional, defaults to "my_rag_collection"
+   EMBEDDING_MODEL=text-embedding-3-large  # Optional, defaults to "text-embedding-3-large"
+   RAG_VECTOR_SIZE=3072  # Optional, auto-set based on embedding model
    GOOGLE_SERVICE_ACCOUNT_FILE=credentials/your-service-account.json
    GOOGLE_DRIVE_FOLDER_ID=your_google_drive_folder_id_here
    ```
@@ -58,16 +61,26 @@ The workflow includes a RAG (Retrieval-Augmented Generation) tool that connects 
 - `campaign_update_agent`
 - `qa_agent`
 
-The `retrieve_rag_information` and `retrieve_campaign_briefs` tools allow these agents to search and retrieve relevant documentation and campaign briefs from your Qdrant vector store to guide their work.
+The `retrieve_rag_information` and `retrieve_campaign_briefs` tools allow these agents to search and retrieve relevant documentation and campaign briefs from the Qdrant vector Database to guide their work.
 
-### Setting up Qdrant
+### Setting up Qdrant Cloud
 
-1. Install and run Qdrant (using Docker):
-```bash
-docker run -p 6333:6333 qdrant/qdrant
-```
+This project uses **Qdrant Cloud** (not a local instance). To set up:
 
-2. Ensure your `.env` file has the correct Qdrant configuration
+1. **Create a Qdrant Cloud account:**
+   - Go to [cloud.qdrant.io](https://cloud.qdrant.io)
+   - Sign up and create a cluster
+
+2. **Get your cluster credentials:**
+   - Copy your cluster URL (format: `https://your-cluster-id.qdrant.io`)
+   - Copy your API key from the cluster settings
+
+3. **Configure environment variables:**
+   - Set `QDRANT_URL` to your cluster URL
+   - Set `QDRANT_API_KEY` to your API key
+   - Optionally set `QDRANT_COLLECTION_NAME` (defaults to `my_rag_collection`)
+
+The system uses `text-embedding-3-large` by default for PDF and Campaign Brief spreadsheet metadata information storing, which requires 3072-dimensional vectors over the regular setting for better performance. The collection will be automatically created with the correct dimensions when running the ingestion script.
 
 ### Syncing Documents from Google Drive
 
@@ -104,12 +117,16 @@ processed = sync_from_gdrive_folder(
 ```
 
 **Environment Variables:**
-- `GOOGLE_SERVICE_ACCOUNT_FILE`: Path to your Google service account JSON file (e.g., `credentials/your-service-account.json`)
-- `QDRANT_HOST`: Qdrant server host (default: `localhost`)
-- `QDRANT_PORT`: Qdrant server port (default: `6333`)
-- `QDRANT_API_KEY`: Optional Qdrant API key for authenticated instances
+- `GOOGLE_SERVICE_ACCOUNT_FILE`: Path to custom Google service account JSON file (e.g., `credentials/your-service-account.json`)
+- `QDRANT_URL`: Qdrant Cloud cluster URL (required, format: `https://your-cluster-id.qdrant.io`)
+- `QDRANT_API_KEY`: Qdrant Cloud API key (required for authentication)
 - `QDRANT_COLLECTION_NAME`: Qdrant collection name (default: `my_rag_collection`)
+- `EMBEDDING_MODEL`: Embedding model to use (default: `text-embedding-3-large`)
+- `RAG_VECTOR_SIZE`: Vector dimensions (auto-set based on embedding model, 3072 for large, 1536 for small)
 - `CAMPAIGNS_FOLDER_NAME`: Optional name of the inner folder containing campaign spreadsheets (default: `Campaigns`)
+- `QDRANT_BATCH_SIZE`: Batch size for upsert operations (default: `50`)
+- `QDRANT_MAX_RETRIES`: Maximum retries for failed operations (default: `3`)
+- `QDRANT_RETRY_DELAY`: Delay between retries in seconds (default: `5`)
 
 **What gets indexed:**
 - **Outer folder**: PDFs and DOCX files are indexed as "document" type (best practices, guidelines)
@@ -138,14 +155,13 @@ processed = sync_from_gdrive_folder(
    ```
 
 4. **Set up Google Service Account:**
-   - Place your Google service account JSON file in the `credentials/` directory
-   - Update `GOOGLE_SERVICE_ACCOUNT_FILE` in `.env` to point to your file
-   - **Note:** The `credentials/` folder is gitignored for security
+   - Place a Google service account JSON file in the `credentials/` directory
+   - Update `GOOGLE_SERVICE_ACCOUNT_FILE` in `.env` to point to the JSON file
 
-5. **Run Qdrant:**
-   ```bash
-   docker run -p 6333:6333 qdrant/qdrant
-   ```
+5. **Set up Qdrant Cloud:**
+   - Create a Qdrant Cloud account at [cloud.qdrant.io](https://cloud.qdrant.io)
+   - Create a cluster and get your cluster URL and API key
+   - Set `QDRANT_URL` and `QDRANT_API_KEY` in your `.env` file
 
 ## Next Steps
 

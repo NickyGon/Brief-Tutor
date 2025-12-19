@@ -11,6 +11,7 @@ import io
 import tempfile
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -38,9 +39,36 @@ load_dotenv()
 CHUNK_SIZE_CHARS = int(os.getenv("RAG_CHUNK_SIZE_CHARS", "1000"))
 CHUNK_OVERLAP_CHARS = int(os.getenv("RAG_CHUNK_OVERLAP_CHARS", "200"))
 
-# Adjust to whatever your embedding model outputs.
-# e.g. 1536 for OpenAI text-embedding-3-small, 768/1024 for many HF models.
-VECTOR_SIZE = int(os.getenv("RAG_VECTOR_SIZE", "1536"))
+# Batch size for Qdrant upserts (to avoid timeouts on large files)
+QDRANT_BATCH_SIZE = int(os.getenv("QDRANT_BATCH_SIZE", "50"))  # Process 50 chunks at a time
+QDRANT_MAX_RETRIES = int(os.getenv("QDRANT_MAX_RETRIES", "3"))  # Retry up to 3 times
+QDRANT_RETRY_DELAY = int(os.getenv("QDRANT_RETRY_DELAY", "5"))  # Wait 5 seconds between retries
+
+# -----------------------------
+# Embedding Model Configuration (Single Source of Truth)
+# -----------------------------
+
+def get_embedding_model() -> str:
+    """Get the embedding model name from environment variable. Defaults to text-embedding-3-large."""
+    return os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
+
+
+def get_vector_size() -> int:
+    """
+    Get the vector size based on embedding model.
+    
+    Note: RAG_VECTOR_SIZE env var can override, but ensure_qdrant_collection()
+    will enforce the correct size for the embedding model to prevent mismatches.
+    """
+    embedding_model = get_embedding_model()
+    default_size = 3072 if "large" in embedding_model.lower() else 1536
+    # Allow override via env var, but validation in ensure_qdrant_collection will enforce correctness
+    return int(os.getenv("RAG_VECTOR_SIZE", str(default_size)))
+
+
+# Global constants (computed once at module load)
+EMBEDDING_MODEL = get_embedding_model()
+VECTOR_SIZE = get_vector_size()
 
 SUPPORTED_MIME_TYPES = {
     "application/pdf": "pdf",
@@ -252,7 +280,7 @@ def extract_text_from_xlsx(content: bytes, file_meta: Dict[str, Any]) -> tuple[s
         sys.path.insert(0, str(project_root))
     
     try:
-        from graph.tools import load_and_parse_spreadsheet
+        from graph.tools import _parse_spreadsheet_internal
     except ImportError:
         # Fallback if import fails
         import pandas as pd
@@ -275,9 +303,9 @@ def extract_text_from_xlsx(content: bytes, file_meta: Dict[str, Any]) -> tuple[s
             tmp.write(content)
             temp_file = tmp.name
         
-        # Use load_and_parse_spreadsheet to parse the file
-        # Note: load_and_parse_spreadsheet returns a dict (not a CampaignBrief object)
-        campaign_brief = load_and_parse_spreadsheet(temp_file)
+        # Use _parse_spreadsheet_internal to parse the file (not the tool wrapper)
+        # Note: _parse_spreadsheet_internal returns a dict (not a CampaignBrief object)
+        campaign_brief = _parse_spreadsheet_internal(temp_file)
         
         # Extract structured data from the returned dict
         structured_data = {
@@ -359,6 +387,117 @@ def extract_text_from_xlsx(content: bytes, file_meta: Dict[str, Any]) -> tuple[s
             return "\n".join(text_parts), None
         except Exception as fallback_error:
             return f"Error extracting text from Excel file: {str(e)}", None
+    finally:
+        # Clean up temporary file
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except Exception:
+                pass  # Ignore cleanup errors
+
+
+def extract_campaign_metadata(
+    content: bytes, 
+    file_meta: Dict[str, Any]
+) -> tuple[Dict[str, Any], str]:
+    """
+    Extract lightweight metadata from campaign brief spreadsheets.
+    This function extracts only essential metadata for similarity search,
+    not the full campaign data.
+    
+    Args:
+        content: Raw bytes of the Excel file
+        file_meta: File metadata dict from Google Drive with keys: id, name, modifiedTime
+    
+    Returns:
+        tuple: (metadata_dict, compact_text_representation)
+        - metadata_dict: Contains file_id, file_name, task_type, dealership_name,
+                        asset_summary, total_campaigns, campaign_ids, file_modified_time
+        - compact_text_representation: Text string for embedding/search
+    """
+    # Add project root to path to import from graph.tools
+    project_root = Path(__file__).parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    
+    temp_file = None
+    try:
+        from graph.tools import _parse_spreadsheet_internal
+    except ImportError:
+        # Fallback: return minimal metadata if import fails
+        return {
+            "file_id": file_meta["id"],
+            "file_name": file_meta["name"],
+            "task_type": None,
+            "dealership_name": None,
+            "asset_summary": None,
+            "total_campaigns": 0,
+            "campaign_ids": [],
+            "file_modified_time": file_meta.get("modifiedTime"),
+        }, f"Campaign Brief: {file_meta.get('name', 'Unknown')}"
+    
+    try:
+        # Create temporary file to save the Excel content
+        with tempfile.NamedTemporaryFile(mode='wb', suffix='.xlsx', delete=False) as tmp:
+            tmp.write(content)
+            temp_file = tmp.name
+        
+        # Use _parse_spreadsheet_internal to parse the file (not the tool wrapper)
+        campaign_brief = _parse_spreadsheet_internal(temp_file)
+        
+        # Extract only essential metadata
+        task_type = campaign_brief.get("task_type")
+        dealership_name = campaign_brief.get("dealership_name")
+        asset_summary = campaign_brief.get("asset_summary")
+        campaigns = campaign_brief.get("campaigns", [])
+        
+        # Extract campaign IDs only (not full campaign data)
+        campaign_ids = []
+        for campaign in campaigns:
+            if isinstance(campaign, dict):
+                campaign_id = campaign.get("campaign_id")
+            else:
+                # Campaign might be a Pydantic model
+                campaign_id = getattr(campaign, "campaign_id", None)
+            if campaign_id:
+                campaign_ids.append(campaign_id)
+        
+        metadata = {
+            "file_id": file_meta["id"],
+            "file_name": file_meta["name"],
+            "task_type": task_type,
+            "dealership_name": dealership_name,
+            "asset_summary": asset_summary,
+            "total_campaigns": len(campaign_ids),
+            "campaign_ids": campaign_ids,
+            "file_modified_time": file_meta.get("modifiedTime"),
+        }
+        
+        # Create compact text representation for embedding
+        compact_text_parts = [
+            f"Campaign Brief: {file_meta.get('name', 'Unknown')}",
+            f"Task Type: {task_type or 'Unknown'}",
+            f"Dealership: {dealership_name or 'Unknown'}",
+            f"Asset Summary: {asset_summary or 'N/A'}",
+            f"Campaigns: {', '.join(campaign_ids) if campaign_ids else 'None'}"
+        ]
+        compact_text = "\n".join(compact_text_parts)
+        
+        return metadata, compact_text
+        
+    except Exception as e:
+        # Fallback: return minimal metadata on error
+        print(f"[WARN] Failed to extract campaign metadata from {file_meta.get('name', 'Unknown')}: {e}")
+        return {
+            "file_id": file_meta["id"],
+            "file_name": file_meta["name"],
+            "task_type": None,
+            "dealership_name": None,
+            "asset_summary": None,
+            "total_campaigns": 0,
+            "campaign_ids": [],
+            "file_modified_time": file_meta.get("modifiedTime"),
+        }, f"Campaign Brief: {file_meta.get('name', 'Unknown')}"
     finally:
         # Clean up temporary file
         if temp_file and os.path.exists(temp_file):
@@ -468,12 +607,43 @@ def get_qdrant_client() -> QdrantClient:
 
 
 def ensure_qdrant_collection(
-    client: QdrantClient, collection_name: str, vector_size: int = VECTOR_SIZE
+    client: QdrantClient, collection_name: str, vector_size: int = None
 ) -> None:
     """
-    Ensures the Qdrant collection exists with the given vector size.
-    If it doesn't, it creates it. Also ensures required payload indexes exist.
+    Ensures the Qdrant collection exists with the correct vector size.
+    If it doesn't, it creates it. If it exists with wrong dimensions, deletes and recreates it.
+    Also ensures required payload indexes exist.
+    
+    Args:
+        client: Qdrant client instance
+        collection_name: Name of the collection
+        vector_size: Vector size to use (defaults to VECTOR_SIZE, which should be 3072 for text-embedding-3-large)
     """
+    # CRITICAL: Always enforce correct vector size based on embedding model
+    # This overrides any incorrect RAG_VECTOR_SIZE environment variable or VECTOR_SIZE constant
+    embedding_model = EMBEDDING_MODEL
+    
+    # Calculate expected size directly from embedding model (don't use get_vector_size() which respects RAG_VECTOR_SIZE)
+    if "large" in embedding_model.lower():
+        expected_size = 3072
+    else:
+        expected_size = 1536
+    
+    # Override vector_size if it was passed in or from VECTOR_SIZE constant
+    if vector_size is None:
+        vector_size = VECTOR_SIZE
+    
+    # Always enforce the correct size for the embedding model
+    if vector_size != expected_size:
+        print(f"⚠ WARNING: Vector size {vector_size} doesn't match expected {expected_size} for {embedding_model}")
+        print(f"  Overriding to correct size {expected_size}")
+        vector_size = expected_size
+    
+    # Log the vector size being used for transparency (after validation)
+    print(f"📊 Collection Configuration:")
+    print(f"   Embedding Model: {embedding_model}")
+    print(f"   Vector Size: {vector_size} dimensions")
+    
     collections = client.get_collections().collections
     existing = {c.name for c in collections}
 
@@ -485,7 +655,33 @@ def ensure_qdrant_collection(
                 distance=qmodels.Distance.COSINE,
             ),
         )
-        print(f"Created collection '{collection_name}'")
+        print(f"✓ Created collection '{collection_name}' with vector size {vector_size} dimensions")
+    else:
+        # Check if the existing collection has the correct vector size
+        collection_info = client.get_collection(collection_name)
+        existing_vector_size = collection_info.config.params.vectors.size
+        
+        if existing_vector_size != vector_size:
+            print(f"⚠ Collection '{collection_name}' has vector size {existing_vector_size}, but expected {vector_size}")
+            print(f"  Deleting and recreating collection with correct dimensions...")
+            
+            # Delete the existing collection
+            client.delete_collection(collection_name)
+            print(f"  ✓ Deleted old collection")
+            
+            # Create new collection with correct dimensions
+            client.create_collection(
+                collection_name=collection_name,
+                vectors_config=qmodels.VectorParams(
+                    size=vector_size,
+                    distance=qmodels.Distance.COSINE,
+                ),
+            )
+            print(f"  ✓ Created new collection '{collection_name}' with vector size {vector_size}")
+            print(f"  ⚠ NOTE: All existing data in this collection has been deleted.")
+            print(f"  ⚠ You will need to re-run the ingestion script to re-index your documents.")
+        else:
+            print(f"✓ Collection '{collection_name}' exists with correct vector size {vector_size}")
     
     # Ensure payload indexes exist for filtering
     # Always try to create indexes - Qdrant will return an error if they already exist
@@ -493,6 +689,8 @@ def ensure_qdrant_collection(
         "file_id": qmodels.PayloadSchemaType.KEYWORD,
         "file_modified_time": qmodels.PayloadSchemaType.KEYWORD,
         "file_type": qmodels.PayloadSchemaType.KEYWORD,
+        "task_type": qmodels.PayloadSchemaType.KEYWORD,  # For campaign metadata filtering
+        "dealership_name": qmodels.PayloadSchemaType.KEYWORD,  # For campaign metadata filtering
     }
     
     for field_name, field_schema in required_indexes.items():
@@ -632,38 +830,142 @@ def needs_update(
 
 def embed_text(texts: List[str]) -> List[List[float]]:
     """
-    Compute embeddings for a list of texts.
-
-    IMPORTANT: Replace this with your actual embedding provider.
-
-    For example, with OpenAI:
+    Compute embeddings for a list of texts using OpenAI embeddings.
+    
+    Uses the embedding model specified by EMBEDDING_MODEL environment variable.
+    Defaults to "text-embedding-3-large" (3072 dimensions, better quality).
+    Alternative: "text-embedding-3-small" (1536 dimensions, more cost-effective).
+    
+    Both models support up to 8,192 tokens per input, which is well above the chunk size.
+    """
+    embedding_model = EMBEDDING_MODEL
+    
+    try:
         from openai import OpenAI
         client = OpenAI()
+        
+        # Batch process texts (OpenAI API handles batching efficiently)
         resp = client.embeddings.create(
-            model="text-embedding-3-small",
+            model=embedding_model,
             input=texts,
         )
         return [d.embedding for d in resp.data]
+    
+    except ImportError:
+        print("[WARN] OpenAI library not available. Using fallback hash-based embeddings.")
+        print("       Install with: pip install openai")
+        # Fallback to hash-based embeddings if OpenAI is not available
+        import hashlib
+        import math
 
-    Or with a local HuggingFace model, etc.
+        vectors: List[List[float]] = []
+        for t in texts:
+            h = hashlib.sha256(t.encode("utf-8")).digest()
+            # repeat / trim to VECTOR_SIZE
+            raw = list(h) * ((VECTOR_SIZE // len(h)) + 1)
+            raw = raw[:VECTOR_SIZE]
+            # normalize to [0,1]
+            vec = [x / 255.0 for x in raw]
+            # l2 normalize
+            norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+            vec = [v / norm for v in vec]
+            vectors.append(vec)
+        return vectors
+    
+    except Exception as e:
+        print(f"[ERROR] Failed to generate embeddings: {e}")
+        print("       Falling back to hash-based embeddings.")
+        # Fallback to hash-based embeddings on error
+        import hashlib
+        import math
+
+        vectors: List[List[float]] = []
+        for t in texts:
+            h = hashlib.sha256(t.encode("utf-8")).digest()
+            raw = list(h) * ((VECTOR_SIZE // len(h)) + 1)
+            raw = raw[:VECTOR_SIZE]
+            vec = [x / 255.0 for x in raw]
+            norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+            vec = [v / norm for v in vec]
+            vectors.append(vec)
+        return vectors
+
+
+# -----------------------------
+# Helper function for batched Qdrant upserts with retry logic
+# -----------------------------
+
+def batch_upsert_with_retry(
+    qdrant_client: QdrantClient,
+    collection_name: str,
+    chunks: List[Dict[str, Any]],
+    embeddings: List[List[float]],
+    batch_size: int = QDRANT_BATCH_SIZE,
+    max_retries: int = QDRANT_MAX_RETRIES,
+    retry_delay: int = QDRANT_RETRY_DELAY
+) -> None:
     """
-
-    import hashlib
-    import math
-
-    vectors: List[List[float]] = []
-    for t in texts:
-        h = hashlib.sha256(t.encode("utf-8")).digest()
-        # repeat / trim to VECTOR_SIZE
-        raw = list(h) * ((VECTOR_SIZE // len(h)) + 1)
-        raw = raw[:VECTOR_SIZE]
-        # normalize to [0,1]
-        vec = [x / 255.0 for x in raw]
-        # l2 normalize
-        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-        vec = [v / norm for v in vec]
-        vectors.append(vec)
-    return vectors
+    Upsert chunks to Qdrant in batches with retry logic to handle timeouts.
+    
+    Args:
+        qdrant_client: Qdrant client instance
+        collection_name: Name of the collection
+        chunks: List of chunk dictionaries with id_suffix and payload
+        embeddings: List of embedding vectors (one per chunk)
+        batch_size: Number of chunks to process per batch (default: QDRANT_BATCH_SIZE)
+        max_retries: Maximum number of retry attempts (default: QDRANT_MAX_RETRIES)
+        retry_delay: Delay in seconds between retries (default: QDRANT_RETRY_DELAY)
+    """
+    total_chunks = len(chunks)
+    if total_chunks == 0:
+        return
+    
+    # Get file_id from first chunk for ID generation
+    file_id = chunks[0]["payload"].get("file_id", "unknown")
+    
+    # Process in batches
+    for batch_start in range(0, total_chunks, batch_size):
+        batch_end = min(batch_start + batch_size, total_chunks)
+        batch_chunks = chunks[batch_start:batch_end]
+        batch_embeddings = embeddings[batch_start:batch_end]
+        
+        # Prepare batch
+        batch_ids = [uuid5(NAMESPACE_URL, f"{file_id}_{c['id_suffix']}") for c in batch_chunks]
+        batch_payloads = [c["payload"] for c in batch_chunks]
+        
+        # Retry logic
+        for attempt in range(max_retries):
+            try:
+                qdrant_client.upsert(
+                    collection_name=collection_name,
+                    points=qmodels.Batch(
+                        ids=batch_ids,
+                        vectors=batch_embeddings,
+                        payloads=batch_payloads,
+                    ),
+                )
+                # Success - move to next batch
+                if batch_start == 0:
+                    print(f"  [BATCH {batch_start//batch_size + 1}] Successfully upserted {len(batch_chunks)} chunks")
+                break
+            except Exception as e:
+                error_msg = str(e).lower()
+                is_timeout = "timeout" in error_msg or "timed out" in error_msg
+                
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (attempt + 1)  # Exponential backoff
+                    print(f"  [BATCH {batch_start//batch_size + 1}] Attempt {attempt + 1}/{max_retries} failed: {e}")
+                    if is_timeout:
+                        print(f"  [BATCH {batch_start//batch_size + 1}] Timeout detected. Retrying in {wait_time} seconds...")
+                    else:
+                        print(f"  [BATCH {batch_start//batch_size + 1}] Error detected. Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    # Final attempt failed
+                    raise Exception(
+                        f"Failed to upsert batch {batch_start//batch_size + 1} after {max_retries} attempts. "
+                        f"Last error: {e}"
+                    )
 
 
 # -----------------------------
@@ -680,7 +982,9 @@ def _process_spreadsheet_files(
     folder_path: str,
 ) -> int:
     """
-    Process a list of spreadsheet files and index them into Qdrant.
+    Process a list of spreadsheet files and index lightweight metadata into Qdrant.
+    Stores only ONE document per brief (not per-campaign) with metadata for similarity search.
+    Full campaign data remains in Google Drive and can be fetched on-demand.
     
     Args:
         drive_service: Google Drive API service
@@ -708,59 +1012,75 @@ def _process_spreadsheet_files(
 
         try:
             content = download_file_content(drive_service, file_id, mime_type)
-            text, structured_data = extract_text_for_file(mime_type, content, f)
-            if not text.strip():
-                print(f"      [WARN] No text extracted from {file_name}, skipping.")
+            
+            # Extract lightweight metadata only (not full campaign data)
+            metadata, compact_text = extract_campaign_metadata(content, f)
+            
+            if not compact_text.strip():
+                print(f"      [WARN] No metadata extracted from {file_name}, skipping.")
                 continue
 
-            chunks = chunk_text(text, f)
-            if not chunks:
-                print(f"      [WARN] No chunks generated for {file_name}, skipping.")
-                continue
+            # Create a single embedding for the entire brief metadata
+            # (not chunked, since it's already compact)
+            embedding = embed_text([compact_text])[0]
 
-            # Add structured data to payload for campaign briefs
-            # Include task_type and folder_path from the folder structure
-            for chunk in chunks:
-                if structured_data:
-                    # Add structured brief data to payload for easy retrieval
-                    chunk["payload"]["structured_brief"] = structured_data
-                    chunk["payload"]["file_type"] = structured_data.get("file_type", "campaign_brief")
-                    # Add folder-based task_type (may override spreadsheet's task_type if different)
-                    chunk["payload"]["folder_task_type"] = task_type
-                    chunk["payload"]["folder_path"] = folder_path
-                    # Also update structured_brief with folder information
-                    if isinstance(chunk["payload"]["structured_brief"], dict):
-                        chunk["payload"]["structured_brief"]["folder_task_type"] = task_type
-                        chunk["payload"]["structured_brief"]["folder_path"] = folder_path
-                else:
-                    chunk["payload"]["file_type"] = "campaign_brief"
-                    chunk["payload"]["folder_task_type"] = task_type
-                    chunk["payload"]["folder_path"] = folder_path
+            # Build payload with metadata and Google Drive file_id for on-demand fetching
+            payload = {
+                "file_type": "campaign_metadata",
+                "file_id": file_id,  # Google Drive file ID for fetching full data
+                "file_name": metadata["file_name"],
+                "task_type": metadata["task_type"],
+                "dealership_name": metadata["dealership_name"],
+                "asset_summary": metadata["asset_summary"],
+                "total_campaigns": metadata["total_campaigns"],
+                "campaign_ids": metadata["campaign_ids"],
+                "file_modified_time": metadata["file_modified_time"],
+                "folder_task_type": task_type,  # From folder structure
+                "folder_path": folder_path,  # From folder structure
+                "text": compact_text,  # For backward compatibility
+                "page_content": compact_text,  # For LangChain compatibility
+            }
 
-            texts = [c["text"] for c in chunks]
-            embeddings = embed_text(texts)
+            # Use file_id as the unique identifier (single point per brief)
+            # This ensures we only have one document per brief in Qdrant
+            point_id = uuid5(NAMESPACE_URL, f"campaign_metadata_{file_id}")
 
-            # Prepare Qdrant batch
-            ids = [ uuid5(NAMESPACE_URL, f"{file_id}_{c['id_suffix']}") for c in chunks ]
-            payloads = [c["payload"] for c in chunks]
-
-            qdrant_client.upsert(
-                collection_name=collection_name,
-                points=qmodels.Batch(
-                    ids=ids,
-                    vectors=embeddings,
-                    payloads=payloads,
-                ),
-            )
+            # Retry logic for single point upsert
+            for attempt in range(QDRANT_MAX_RETRIES):
+                try:
+                    qdrant_client.upsert(
+                        collection_name=collection_name,
+                        points=qmodels.Batch(
+                            ids=[point_id],
+                            vectors=[embedding],
+                            payloads=[payload],
+                        ),
+                    )
+                    break
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    is_timeout = "timeout" in error_msg or "timed out" in error_msg
+                    
+                    if attempt < QDRANT_MAX_RETRIES - 1:
+                        wait_time = QDRANT_RETRY_DELAY * (attempt + 1)
+                        print(f"      [RETRY] Attempt {attempt + 1}/{QDRANT_MAX_RETRIES} failed: {e}")
+                        if is_timeout:
+                            print(f"      [RETRY] Timeout detected. Retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
+                    else:
+                        raise Exception(f"Failed to upsert campaign metadata after {QDRANT_MAX_RETRIES} attempts: {e}")
 
             print(
-                f"      [OK] Indexed {len(chunks)} chunks for {file_name} "
+                f"      [OK] Indexed metadata for {file_name} "
+                f"({metadata['total_campaigns']} campaigns) "
                 f"into collection '{collection_name}'"
             )
             processed_count += 1
 
         except Exception as e:
             print(f"      [ERROR] Failed to process {file_name} (id={file_id}): {e}")
+            import traceback
+            traceback.print_exc()
     
     return processed_count
 
@@ -809,7 +1129,9 @@ def sync_from_gdrive_folder(
     if qdrant_client is None:
         qdrant_client = get_qdrant_client()
 
-    ensure_qdrant_collection(qdrant_client, collection_name, VECTOR_SIZE)
+    # Ensure collection exists with correct vector size (3072 for text-embedding-3-large)
+    # This will automatically fix dimension mismatches if they exist
+    ensure_qdrant_collection(qdrant_client, collection_name)
 
     # Get campaigns folder name from parameter or environment variable
     if campaigns_folder_name is None:
@@ -853,19 +1175,22 @@ def sync_from_gdrive_folder(
                 chunk["payload"]["file_type"] = "document"
 
             texts = [c["text"] for c in chunks]
+            
+            # Generate embeddings in batches to avoid memory issues
+            print(f"  Generating embeddings for {len(chunks)} chunks...")
             embeddings = embed_text(texts)
+            print(f"  ✓ Generated {len(embeddings)} embeddings")
 
-            # Prepare Qdrant batch
-            ids = [ uuid5(NAMESPACE_URL, f"{file_id}_{c['id_suffix']}") for c in chunks ]
-            payloads = [c["payload"] for c in chunks]
-
-            qdrant_client.upsert(
+            # Upsert in batches with retry logic to handle timeouts
+            print(f"  Upserting {len(chunks)} chunks in batches of {QDRANT_BATCH_SIZE}...")
+            batch_upsert_with_retry(
+                qdrant_client=qdrant_client,
                 collection_name=collection_name,
-                points=qmodels.Batch(
-                    ids=ids,
-                    vectors=embeddings,
-                    payloads=payloads,
-                ),
+                chunks=chunks,
+                embeddings=embeddings,
+                batch_size=QDRANT_BATCH_SIZE,
+                max_retries=QDRANT_MAX_RETRIES,
+                retry_delay=QDRANT_RETRY_DELAY
             )
 
             print(

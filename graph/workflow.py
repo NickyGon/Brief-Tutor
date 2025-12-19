@@ -17,8 +17,8 @@ DEFAULT_MODEL = "gpt-5-nano" # Optimal for speed and cost
 DEFAULT_MAX_TOKENS = 1000
 DEFAULT_TEMPERATURE = 0.7  # Optimal for RAG and structured data processing
 
-# Higher token limits for agents that need to generate multiple diagnoses
-TASK_AGENT_MAX_TOKENS = 4000  # For theme_agent, new_creative_agent, campaign_update_agent
+# Higher token limits for agents that need to generate or evaluate multiple diagnoses
+TASK_AGENT_MAX_TOKENS = 12000  # For theme_agent, new_creative_agent, campaign_update_agent, qa_agent
 
 
 def load_agent_config(yaml_path: str) -> Dict[str, Any]:
@@ -53,8 +53,8 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
     node_name = config.get("name", "agent").lower().replace(" ", "_")
     
     # Create LLM with specified parameters
-    # Task-specific agents need more tokens to generate diagnoses for multiple campaigns
-    max_tokens = TASK_AGENT_MAX_TOKENS if node_name in ["theme_agent", "new_creative_agent", "campaign_update_agent"] else DEFAULT_MAX_TOKENS
+    # Task-specific agents and QA agent need more tokens to generate/validate diagnoses for multiple campaigns
+    max_tokens = TASK_AGENT_MAX_TOKENS if node_name in ["theme_agent", "new_creative_agent", "campaign_update_agent", "qa_agent"] else DEFAULT_MAX_TOKENS
     
     llm = ChatOpenAI(
         model=DEFAULT_MODEL,
