@@ -12,6 +12,10 @@ import tempfile
 import os
 import sys
 import time
+import json
+import hashlib
+import math
+import traceback
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -19,7 +23,7 @@ from datetime import datetime
 
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
@@ -28,6 +32,21 @@ from pypdf import PdfReader
 from docx import Document as DocxDocument  # for .docx files
 from dotenv import load_dotenv
 from uuid import uuid5, NAMESPACE_URL
+
+import pandas as pd
+from openpyxl import load_workbook
+from openai import OpenAI
+
+# Conditional imports that may fail
+try:
+    from graph.tools import _parse_spreadsheet_internal
+except ImportError:
+    _parse_spreadsheet_internal = None
+
+try:
+    from graph.models import CampaignDiagnosis
+except ImportError:
+    CampaignDiagnosis = None
 
 load_dotenv()
 
@@ -82,12 +101,34 @@ SUPPORTED_MIME_TYPES = {
 # -----------------------------
 
 
-def get_drive_service() -> Any:
+def get_service_account_email() -> Optional[str]:
+    """
+    Helper function to extract the service account email from the JSON file.
+    
+    Returns:
+        Service account email address or None if not found
+    """
+    service_account_file = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE")
+    if not service_account_file:
+        return None
+    
+    try:
+        with open(service_account_file, 'r') as f:
+            account_info = json.load(f)
+            return account_info.get("client_email")
+    except Exception:
+        return None
+
+
+def get_drive_service(write_access: bool = False) -> Any:
     """
     Builds an authenticated Google Drive API service using a service account.
 
     Expects:
         - GOOGLE_SERVICE_ACCOUNT_FILE: path to your service account JSON.
+    
+    Args:
+        write_access: If True, requests write access (readonly by default for safety)
     """
     service_account_file = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE")
     if not service_account_file:
@@ -96,7 +137,11 @@ def get_drive_service() -> Any:
             "Point it to your service account JSON file."
         )
 
-    scopes = ["https://www.googleapis.com/auth/drive.readonly"]
+    if write_access:
+        # Use drive scope to allow creating files in existing folders
+        scopes = ["https://www.googleapis.com/auth/drive"]  # Full read/write access to Google Drive
+    else:
+        scopes = ["https://www.googleapis.com/auth/drive.readonly"]
     credentials = service_account.Credentials.from_service_account_file(
         service_account_file, scopes=scopes
     )
@@ -139,7 +184,7 @@ def list_files_in_folder(
                 q=query,
                 spaces="drive",
                 fields="nextPageToken, files(id, name, mimeType, modifiedTime)",
-                pageToken=page_token,
+                pageToken=page_token
             )
             .execute()
         )
@@ -150,6 +195,75 @@ def list_files_in_folder(
             break
 
     return files
+
+
+def share_folder_with_service_account(
+    drive_service: Any, folder_id: str, service_account_email: Optional[str] = None
+) -> bool:
+    """
+    Share a Google Drive folder with the service account and grant Editor permissions.
+    
+    This function requires write access to Google Drive. If the provided drive_service
+    has read-only access, a new write-access service will be created automatically.
+    
+    Args:
+        drive_service: Google Drive API service (read-only or write-access)
+        folder_id: ID of the folder to share
+        service_account_email: Service account email (will be retrieved if not provided)
+    
+    Returns:
+        True if sharing was successful, False otherwise
+    """
+    if service_account_email is None:
+        service_account_email = get_service_account_email()
+    
+    if not service_account_email:
+        print("[Drive] Warning: Could not determine service account email for sharing")
+        return False
+    
+    # Check if we need write access and create a new service if needed
+    # We'll try with the provided service first, and if it fails with insufficient scopes,
+    # create a new service with write access
+    try:
+        # Create permission to share folder with service account as Editor
+        permission = {
+            "type": "user",
+            "role": "writer",  # Editor role in Drive API
+            "emailAddress": service_account_email
+        }
+        
+        drive_service.permissions().create(
+            fileId=folder_id,
+            body=permission,
+            fields="id"
+        ).execute()
+        
+        print(f"[Drive] ✓ Shared folder (ID: {folder_id}) with service account: {service_account_email}")
+        return True
+    except Exception as e:
+        # If permission already exists, that's fine
+        if "already exists" in str(e).lower() or "duplicate" in str(e).lower() or "Permission already exists" in str(e):
+            print(f"[Drive] Folder already shared with service account: {service_account_email}")
+            return True
+        
+        # If we get an insufficient scopes error, try with a write-access service
+        if "insufficient" in str(e).lower() and ("scope" in str(e).lower() or "permission" in str(e).lower()):
+            try:
+                # Create a new drive service with write access for sharing
+                write_drive_service = get_drive_service(write_access=True)
+                write_drive_service.permissions().create(
+                    fileId=folder_id,
+                    body=permission,
+                    fields="id"
+                ).execute()
+                print(f"[Drive] ✓ Shared folder (ID: {folder_id}) with service account: {service_account_email} (using write-access service)")
+                return True
+            except Exception as write_error:
+                print(f"[Drive] Warning: Failed to share folder with service account: {write_error}")
+                return False
+        
+        print(f"[Drive] Warning: Failed to share folder with service account: {e}")
+        return False
 
 
 def list_folders_in_folder(
@@ -177,7 +291,7 @@ def list_folders_in_folder(
                 q=query,
                 spaces="drive",
                 fields="nextPageToken, files(id, name, mimeType, modifiedTime)",
-                pageToken=page_token,
+                pageToken=page_token
             )
             .execute()
         )
@@ -191,15 +305,17 @@ def list_folders_in_folder(
 
 
 def find_folder_by_name(
-    drive_service: Any, parent_folder_id: str, folder_name: str
+    drive_service: Any, parent_folder_id: str, folder_name: str, auto_share: bool = True
 ) -> Optional[Dict[str, Any]]:
     """
     Find a subfolder by name within a parent folder.
+    Optionally shares the folder with the service account if found.
 
     Args:
         drive_service: Google Drive API service
         parent_folder_id: ID of the parent folder
         folder_name: Name of the folder to find
+        auto_share: If True, automatically share found folder with service account
 
     Returns:
         Folder dict with {id, name, mimeType, modifiedTime} or None if not found
@@ -207,6 +323,9 @@ def find_folder_by_name(
     folders = list_folders_in_folder(drive_service, parent_folder_id)
     for folder in folders:
         if folder.get("name") == folder_name:
+            # Automatically share the folder with service account if requested
+            if auto_share:
+                share_folder_with_service_account(drive_service, folder["id"])
             return folder
     return None
 
@@ -242,8 +361,6 @@ def extract_text_from_pdf(content: bytes) -> str:
     """
     Extracts text from a PDF file (bytes) using pypdf.
     """
-    import io
-
     reader = PdfReader(io.BytesIO(content))
     texts = []
     for page in reader.pages:
@@ -255,8 +372,6 @@ def extract_text_from_docx(content: bytes) -> str:
     """
     Extracts text from a .docx file (bytes) using python-docx.
     """
-    import io
-
     doc = DocxDocument(io.BytesIO(content))
     paragraphs = [p.text for p in doc.paragraphs]
     return "\n".join(paragraphs)
@@ -280,10 +395,10 @@ def extract_text_from_xlsx(content: bytes, file_meta: Dict[str, Any]) -> tuple[s
         sys.path.insert(0, str(project_root))
     
     try:
-        from graph.tools import _parse_spreadsheet_internal
-    except ImportError:
+        if _parse_spreadsheet_internal is None:
+            raise ImportError("_parse_spreadsheet_internal not available")
+    except (ImportError, AttributeError):
         # Fallback if import fails
-        import pandas as pd
         try:
             xls = pd.ExcelFile(io.BytesIO(content))
             text_parts = [f"Spreadsheet: {file_meta.get('name', 'Unknown')}"]
@@ -375,7 +490,6 @@ def extract_text_from_xlsx(content: bytes, file_meta: Dict[str, Any]) -> tuple[s
         
     except Exception as e:
         # Fallback to basic extraction if parsing fails
-        import pandas as pd
         try:
             xls = pd.ExcelFile(io.BytesIO(content))
             text_parts = [f"Spreadsheet: {file_meta.get('name', 'Unknown')}"]
@@ -422,8 +536,9 @@ def extract_campaign_metadata(
     
     temp_file = None
     try:
-        from graph.tools import _parse_spreadsheet_internal
-    except ImportError:
+        if _parse_spreadsheet_internal is None:
+            raise ImportError("_parse_spreadsheet_internal not available")
+    except (ImportError, AttributeError):
         # Fallback: return minimal metadata if import fails
         return {
             "file_id": file_meta["id"],
@@ -505,6 +620,572 @@ def extract_campaign_metadata(
                 os.unlink(temp_file)
             except Exception:
                 pass  # Ignore cleanup errors
+
+
+def extract_diagnosis_metadata(
+    content: bytes,
+    file_meta: Dict[str, Any]
+) -> tuple[Dict[str, Any], str]:
+    """
+    Extract metadata from diagnosis spreadsheets (one row per diagnosis).
+    
+    Expected spreadsheet format:
+    - Columns: campaign_id, status, diagnosis, issues, recommendations, task_type, dealership_name, diagnosis_date, qa_result
+    - One row per diagnosis
+    - First row is header
+    
+    Args:
+        content: Raw bytes of the Excel file
+        file_meta: File metadata dict from Google Drive with keys: id, name, modifiedTime
+    
+    Returns:
+        tuple: (metadata_dict, compact_text_representation)
+        - metadata_dict: Contains file_id, file_name, task_type, dealership_name,
+                        statuses (list), campaign_ids (list), total_diagnoses, diagnosis_date, qa_result
+        - compact_text_representation: Text string for embedding/search (includes diagnosis text, issues, recommendations)
+    """
+    temp_file = None
+    try:
+        # Create temporary file to save the Excel content
+        with tempfile.NamedTemporaryFile(mode='wb', suffix='.xlsx', delete=False) as tmp:
+            tmp.write(content)
+            temp_file = tmp.name
+        
+        # Read Excel file
+        df = pd.read_excel(temp_file, header=0)
+        
+        # Expected columns: campaign_id, status, diagnosis, issues, recommendations, task_type, dealership_name, diagnosis_date, qa_result
+        required_columns = ['campaign_id', 'status', 'diagnosis']
+        optional_columns = ['issues', 'recommendations', 'task_type', 'dealership_name', 'diagnosis_date', 'qa_result']
+        
+        # Check if required columns exist
+        missing_required = [col for col in required_columns if col not in df.columns]
+        if missing_required:
+            raise ValueError(f"Missing required columns: {missing_required}")
+        
+        # Extract metadata from first row (should be consistent across all rows)
+        task_type = None
+        dealership_name = None
+        diagnosis_date = None
+        qa_result = None
+        
+        if 'task_type' in df.columns:
+            task_type = df['task_type'].iloc[0] if not df['task_type'].isna().iloc[0] else None
+            if pd.notna(task_type):
+                task_type = str(task_type).strip()
+        
+        if 'dealership_name' in df.columns:
+            dealership_name = df['dealership_name'].iloc[0] if not df['dealership_name'].isna().iloc[0] else None
+            if pd.notna(dealership_name):
+                dealership_name = str(dealership_name).strip()
+        
+        if 'diagnosis_date' in df.columns:
+            diagnosis_date = df['diagnosis_date'].iloc[0] if not df['diagnosis_date'].isna().iloc[0] else None
+            if pd.notna(diagnosis_date):
+                # Convert to ISO format string if it's a datetime
+                if isinstance(diagnosis_date, pd.Timestamp):
+                    diagnosis_date = diagnosis_date.isoformat()
+                else:
+                    diagnosis_date = str(diagnosis_date).strip()
+        
+        if 'qa_result' in df.columns:
+            qa_result_val = df['qa_result'].iloc[0] if not df['qa_result'].isna().iloc[0] else None
+            if pd.notna(qa_result_val):
+                # Convert to boolean (handle string "true"/"false" or actual boolean)
+                if isinstance(qa_result_val, bool):
+                    qa_result = qa_result_val
+                elif isinstance(qa_result_val, str):
+                    qa_result = qa_result_val.strip().lower() in ('true', '1', 'yes')
+                else:
+                    qa_result = bool(qa_result_val)
+        
+        # Extract unique statuses and campaign IDs
+        statuses = df['status'].dropna().unique().tolist()
+        statuses = [str(s).strip() for s in statuses if pd.notna(s)]
+        
+        campaign_ids = df['campaign_id'].dropna().unique().tolist()
+        campaign_ids = [str(cid).strip() for cid in campaign_ids if pd.notna(cid)]
+        
+        total_diagnoses = len(df)
+        
+        # Build text representation for embedding (include diagnosis text, issues, recommendations)
+        text_parts = [
+            f"Campaign Diagnoses: {file_meta.get('name', 'Unknown')}",
+            f"Task Type: {task_type or 'Unknown'}",
+            f"Dealership: {dealership_name or 'Unknown'}",
+            f"Total Diagnoses: {total_diagnoses}",
+            f"Statuses: {', '.join(statuses) if statuses else 'None'}",
+            f"Campaign IDs: {', '.join(campaign_ids) if campaign_ids else 'None'}"
+        ]
+        
+        # Add diagnosis summaries (first few for compact representation)
+        for idx, row in df.head(5).iterrows():
+            diag_text = str(row['diagnosis']).strip() if pd.notna(row['diagnosis']) else ""
+            status = str(row['status']).strip() if pd.notna(row['status']) else ""
+            campaign_id = str(row['campaign_id']).strip() if pd.notna(row['campaign_id']) else ""
+            
+            text_parts.append(f"\nDiagnosis {idx + 1} ({campaign_id} - {status}):")
+            if diag_text:
+                text_parts.append(f"  {diag_text[:200]}...")  # Truncate for compact representation
+            
+            # Add issues if present
+            if 'issues' in df.columns and pd.notna(row['issues']):
+                issues_val = row['issues']
+                if isinstance(issues_val, str):
+                    try:
+                        issues_list = json.loads(issues_val)
+                    except (json.JSONDecodeError, TypeError):
+                        issues_list = [i.strip() for i in issues_val.split(',') if i.strip()]
+                elif isinstance(issues_val, list):
+                    issues_list = issues_val
+                else:
+                    issues_list = []
+                if issues_list:
+                    text_parts.append(f"  Issues: {', '.join(str(i)[:50] for i in issues_list[:3])}")
+            
+            # Add recommendations if present
+            if 'recommendations' in df.columns and pd.notna(row['recommendations']):
+                recs_val = row['recommendations']
+                if isinstance(recs_val, str):
+                    try:
+                        recs_list = json.loads(recs_val)
+                    except (json.JSONDecodeError, TypeError):
+                        recs_list = [r.strip() for r in recs_val.split(',') if r.strip()]
+                elif isinstance(recs_val, list):
+                    recs_list = recs_val
+                else:
+                    recs_list = []
+                if recs_list:
+                    text_parts.append(f"  Recommendations: {', '.join(str(r)[:50] for r in recs_list[:3])}")
+        
+        if total_diagnoses > 5:
+            text_parts.append(f"\n... and {total_diagnoses - 5} more diagnoses")
+        
+        compact_text = "\n".join(text_parts)
+        
+        metadata = {
+            "file_id": file_meta["id"],
+            "file_name": file_meta["name"],
+            "task_type": task_type,
+            "dealership_name": dealership_name,
+            "statuses": statuses,
+            "campaign_ids": campaign_ids,
+            "total_diagnoses": total_diagnoses,
+            "diagnosis_date": diagnosis_date,
+            "qa_result": qa_result,
+            "file_type": "campaign_diagnosis",
+            "file_modified_time": file_meta.get("modifiedTime"),
+        }
+        
+        return metadata, compact_text
+        
+    except Exception as e:
+        # Fallback: return minimal metadata on error
+        print(f"[WARN] Failed to extract diagnosis metadata from {file_meta.get('name', 'Unknown')}: {e}")
+        traceback.print_exc()
+        return {
+            "file_id": file_meta["id"],
+            "file_name": file_meta["name"],
+            "task_type": None,
+            "dealership_name": None,
+            "statuses": [],
+            "campaign_ids": [],
+            "total_diagnoses": 0,
+            "diagnosis_date": None,
+            "qa_result": None,
+            "file_type": "campaign_diagnosis",
+            "file_modified_time": file_meta.get("modifiedTime"),
+        }, f"Campaign Diagnoses: {file_meta.get('name', 'Unknown')}"
+    finally:
+        # Clean up temporary file
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except Exception:
+                pass  # Ignore cleanup errors
+
+
+def store_diagnoses_to_drive(
+    diagnoses: List[Any],
+    campaign_brief: Dict[str, Any],
+    qa_result: bool,
+    drive_service: Optional[Any] = None,
+    main_drive_folder_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Store diagnoses as Excel spreadsheet in Google Drive after QA passes.
+    
+    Uses Template-diagnoses.xlsx as a template and fills in diagnosis data.
+    Uploads to Google Drive in the appropriate folder structure: Campaigns/[Task Type]/Diagnoses/
+    
+    Args:
+        diagnoses: List of CampaignDiagnosis objects (or dicts with diagnosis data)
+        campaign_brief: CampaignBrief metadata dict (must have task_type, dealership_name, spreadsheet_path)
+        qa_result: QA result (True if passed, False if failed) - not stored in spreadsheet
+        drive_service: Optional Google Drive service (will be created if None)
+        main_drive_folder_id: Optional main Drive folder ID (defaults to env var CAMPAIGNS_DRIVE_FOLDER_ID)
+    
+    Returns:
+        Dict with file_id and file metadata from Google Drive
+    """
+    # Get drive service with write access
+    if drive_service is None:
+        drive_service = get_drive_service(write_access=True)
+    
+    # Get main folder ID from parameter or environment
+    if main_drive_folder_id is None:
+        main_drive_folder_id = os.getenv("CAMPAIGNS_DRIVE_FOLDER_ID")
+        if not main_drive_folder_id:
+            raise RuntimeError(
+                "main_drive_folder_id parameter or CAMPAIGNS_DRIVE_FOLDER_ID env var must be set"
+            )
+    
+    # Extract metadata from campaign_brief
+    task_type = campaign_brief.get("task_type", "")
+    dealership_name = campaign_brief.get("dealership_name")
+    spreadsheet_path = campaign_brief.get("spreadsheet_path", "")
+    
+    if not task_type:
+        raise ValueError("campaign_brief must have a task_type")
+    
+    # Extract filename from spreadsheet_path for naming pattern: [spreadsheetFileName]-diagnoses.xlsx
+    spreadsheet_filename = ""
+    if spreadsheet_path:
+        # Extract filename from path (handle both local paths and URLs)
+        if "/" in spreadsheet_path:
+            spreadsheet_filename = spreadsheet_path.split("/")[-1]
+        elif "\\" in spreadsheet_path:
+            spreadsheet_filename = spreadsheet_path.split("\\")[-1]
+        else:
+            spreadsheet_filename = spreadsheet_path
+        
+        # Remove extension if present
+        if "." in spreadsheet_filename:
+            spreadsheet_filename = spreadsheet_filename.rsplit(".", 1)[0]
+    
+    if not spreadsheet_filename:
+        # Fallback: use date-based filename
+        current_date = datetime.now()
+        date_str = current_date.strftime("%Y-%m-%d")
+        spreadsheet_filename = f"{date_str}-diagnoses"
+    
+    filename = f"{spreadsheet_filename}-diagnoses.xlsx"
+    
+    # Get current date for diagnosis_date column (MM/DD/YYYY format)
+    current_date = datetime.now()
+    date_formatted = current_date.strftime("%m/%d/%Y")
+    
+    # Load template Excel file
+    project_root = Path(__file__).parent
+    template_path = project_root / "Template-diagnoses.xlsx"
+    
+    if not template_path.exists():
+        raise FileNotFoundError(f"Template file not found: {template_path}")
+    
+    # Load template workbook
+    template_wb = load_workbook(template_path)
+    template_ws = template_wb.active
+    
+    # Get headers from first row (row 1 in openpyxl, which is 1-indexed)
+    headers = []
+    header_to_col = {}  # Map normalized header names to column indices
+    for col_idx, cell in enumerate(template_ws[1], start=1):
+        header_value = cell.value if cell.value else ""
+        headers.append(header_value)
+        # Normalize header for matching (lowercase, strip whitespace)
+        normalized_header = str(header_value).lower().strip() if header_value else ""
+        header_to_col[normalized_header] = col_idx
+    
+    # Build data rows starting from row 2 (after headers)
+    row_num = 2
+    for diag in diagnoses:
+        # Extract data from CampaignDiagnosis object or dict
+        if CampaignDiagnosis and isinstance(diag, CampaignDiagnosis):
+            campaign_id = diag.campaign_id
+            status = diag.status
+            diagnosis = diag.diagnosis
+            issues_list = diag.issues if diag.issues else []
+            recommendations_list = diag.recommendations if diag.recommendations else []
+        elif isinstance(diag, dict):
+            campaign_id = diag.get("campaign_id", "")
+            status = diag.get("status", "")
+            diagnosis = diag.get("diagnosis", "")
+            issues_list = diag.get("issues", []) if diag.get("issues") else []
+            recommendations_list = diag.get("recommendations", []) if diag.get("recommendations") else []
+        else:
+            continue  # Skip invalid entries
+        
+        # Format issues and recommendations: join with line breaks
+        issues_text = "\n".join(issues_list) if issues_list else ""
+        recommendations_text = "\n".join(recommendations_list) if recommendations_list else ""
+        
+        # Map data fields to normalized header names
+        data_mapping = {
+            "campaign_id": campaign_id,
+            "status": status,
+            "diagnosis": diagnosis,
+            "issues": issues_text,
+            "recommendations": recommendations_text,
+            "task_type": task_type,
+            "dealership_name": dealership_name or "",
+            "diagnosis_date": date_formatted
+        }
+        
+        # Write row data to template worksheet using normalized header matching
+        for field_name, field_value in data_mapping.items():
+            normalized_field = field_name.lower().strip()
+            if normalized_field in header_to_col:
+                col_idx = header_to_col[normalized_field]
+                template_ws.cell(row=row_num, column=col_idx, value=field_value)
+        
+        row_num += 1
+    
+    if row_num == 2:
+        raise ValueError("No valid diagnoses provided")
+    
+    # Convert workbook to bytes
+    excel_buffer = io.BytesIO()
+    template_wb.save(excel_buffer)
+    excel_buffer.seek(0)
+    excel_content = excel_buffer.read()
+    
+    # Find existing folder structure: Campaigns/[Task Type]/Diagnoses/
+    # For Campaign Update: Campaigns/Campaign Update/Actual/Diagnoses/
+    # Automatically share each folder with service account as we find it
+    # Step 1: Find "Campaigns" folder and share it
+    campaigns_folder = find_folder_by_name(drive_service, main_drive_folder_id, "Campaigns", auto_share=True)
+    if not campaigns_folder:
+        raise RuntimeError(
+            f"Folder 'Campaigns' not found in parent folder (ID: {main_drive_folder_id}). "
+            f"Please ensure the folder structure exists in Google Drive."
+        )
+    
+    campaigns_folder_id = campaigns_folder["id"]
+    
+    # Step 2: Find task type folder (e.g., "New Creative", "Theme", "Campaign Update") and share it
+    task_type_folder = find_folder_by_name(drive_service, campaigns_folder_id, task_type, auto_share=True)
+    if not task_type_folder:
+        raise RuntimeError(
+            f"Folder '{task_type}' not found in 'Campaigns' folder. "
+            f"Please ensure the folder structure exists in Google Drive."
+        )
+    
+    task_type_folder_id = task_type_folder["id"]
+    
+    # Step 3: For Campaign Update, find "Actual" subfolder, then "Diagnoses"
+    # For other task types, find "Diagnoses" directly
+    if task_type.lower() == "campaign update":
+        # Campaign Update has an "Actual" subfolder: Campaigns/Campaign Update/Actual/Diagnoses/
+        actual_folder = find_folder_by_name(drive_service, task_type_folder_id, "Actual", auto_share=True)
+        if not actual_folder:
+            raise RuntimeError(
+                f"Folder 'Actual' not found in '{task_type}' folder. "
+                f"Please ensure the folder structure 'Campaigns/Campaign Update/Actual/' exists in Google Drive."
+            )
+        actual_folder_id = actual_folder["id"]
+        
+        # Find "Diagnoses" folder inside "Actual" and share it
+        diagnoses_folder = find_folder_by_name(drive_service, actual_folder_id, "Diagnoses", auto_share=True)
+        if not diagnoses_folder:
+            raise RuntimeError(
+                f"Folder 'Diagnoses' not found in 'Campaigns/{task_type}/Actual/'. "
+                f"Please ensure the folder structure exists in Google Drive."
+            )
+    else:
+        # For Theme and New Creative: Campaigns/[Task Type]/Diagnoses/
+        diagnoses_folder = find_folder_by_name(drive_service, task_type_folder_id, "Diagnoses", auto_share=True)
+        if not diagnoses_folder:
+            raise RuntimeError(
+                f"Folder 'Diagnoses' not found in '{task_type}' folder. "
+                f"Please ensure the folder structure 'Campaigns/{task_type}/Diagnoses/' exists in Google Drive."
+            )
+    
+    diagnoses_folder_id = diagnoses_folder["id"]
+    
+    # Step 4: Upload Excel file to Diagnoses folder
+    file_metadata = {
+        "name": filename,
+        "parents": [diagnoses_folder_id]
+    }
+    
+    media = MediaIoBaseUpload(
+        io.BytesIO(excel_content),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        resumable=True
+    )
+    
+    try:
+        file = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id, name, mimeType, modifiedTime, createdTime"
+        ).execute()
+        
+        print(f"[Diagnosis Storage] Uploaded diagnosis spreadsheet: {filename} (id={file['id']})")
+    except Exception as e:
+        if "insufficientParentPermissions" in str(e) or "403" in str(e):
+            # Get service account email for helpful error message
+            service_account_email = get_service_account_email()
+            
+            error_msg = (
+                f"\n{'='*80}\n"
+                f"ERROR: Insufficient permissions to upload files to Google Drive.\n"
+                f"{'='*80}\n"
+                f"The service account needs 'Editor' access to the folder specified by\n"
+                f"CAMPAIGNS_DRIVE_FOLDER_ID.\n\n"
+                f"To fix this:\n"
+                f"1. Go to Google Drive and open the folder (ID: {main_drive_folder_id})\n"
+                f"2. Right-click the folder → Share\n"
+                f"3. Add the service account email as an Editor\n"
+                f"4. Click Send\n\n"
+            )
+            if service_account_email:
+                error_msg += f"Service account email: {service_account_email}\n\n"
+            else:
+                error_msg += f"Note: Open your service account JSON file to find the 'client_email' field\n\n"
+            error_msg += f"{'='*80}\n"
+            raise RuntimeError(error_msg) from e
+        raise
+    
+    # Build folder path for return value
+    if task_type.lower() == "campaign update":
+        folder_path = "Campaigns/Campaign Update/Actual/Diagnoses/"
+    else:
+        folder_path = f"Campaigns/{task_type}/Diagnoses/"
+    
+    return {
+        "file_id": file["id"],
+        "file_name": file["name"],
+        "file_metadata": file,
+        "folder_path": folder_path
+    }
+
+
+def store_text_document_to_drive(
+    content: str,
+    file_name: str,
+    task_type: str,
+    drive_service: Optional[Any] = None,
+    main_drive_folder_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Store a text document to Google Drive in the appropriate folder structure.
+    
+    Stores to Campaigns/[Task Type]/Diagnoses/ folder (same as Excel diagnoses).
+    
+    Args:
+        content: The text content of the document to store
+        file_name: The name of the file (e.g., 'spreadsheet-brief-resume.txt')
+        task_type: Task type for folder structure (e.g., 'Theme', 'New Creative', 'Campaign Update')
+        drive_service: Optional Google Drive service (will be created if None)
+        main_drive_folder_id: Optional main Drive folder ID (defaults to env var CAMPAIGNS_DRIVE_FOLDER_ID)
+    
+    Returns:
+        Dict with file_id, file_name, and folder_path from Google Drive
+    """
+    # Get drive service with write access
+    if drive_service is None:
+        drive_service = get_drive_service(write_access=True)
+    
+    # Get main folder ID from parameter or environment
+    if main_drive_folder_id is None:
+        main_drive_folder_id = os.getenv("CAMPAIGNS_DRIVE_FOLDER_ID")
+        if not main_drive_folder_id:
+            raise RuntimeError(
+                "main_drive_folder_id parameter or CAMPAIGNS_DRIVE_FOLDER_ID env var must be set"
+            )
+    
+    if not task_type:
+        raise ValueError("task_type must be provided")
+    
+    # Find existing folder structure: Campaigns/[Task Type]/Diagnoses/
+    # For Campaign Update: Campaigns/Campaign Update/Actual/Diagnoses/
+    # Automatically share each folder with service account as we find it
+    # Step 1: Find "Campaigns" folder and share it
+    campaigns_folder = find_folder_by_name(drive_service, main_drive_folder_id, "Campaigns", auto_share=True)
+    if not campaigns_folder:
+        raise RuntimeError(
+            f"Folder 'Campaigns' not found in parent folder (ID: {main_drive_folder_id}). "
+            f"Please ensure the folder structure exists in Google Drive."
+        )
+    
+    campaigns_folder_id = campaigns_folder["id"]
+    
+    # Step 2: Find task type folder (e.g., "New Creative", "Theme", "Campaign Update") and share it
+    task_type_folder = find_folder_by_name(drive_service, campaigns_folder_id, task_type, auto_share=True)
+    if not task_type_folder:
+        raise RuntimeError(
+            f"Folder '{task_type}' not found in 'Campaigns' folder. "
+            f"Please ensure the folder structure exists in Google Drive."
+        )
+    
+    task_type_folder_id = task_type_folder["id"]
+    
+    # Step 3: For Campaign Update, find "Actual" subfolder, then "Diagnoses"
+    # For other task types, find "Diagnoses" directly
+    if task_type.lower() == "campaign update":
+        # Campaign Update has an "Actual" subfolder: Campaigns/Campaign Update/Actual/Diagnoses/
+        actual_folder = find_folder_by_name(drive_service, task_type_folder_id, "Actual", auto_share=True)
+        if not actual_folder:
+            raise RuntimeError(
+                f"Folder 'Actual' not found in '{task_type}' folder. "
+                f"Please ensure the folder structure 'Campaigns/Campaign Update/Actual/' exists in Google Drive."
+            )
+        actual_folder_id = actual_folder["id"]
+        
+        # Find "Diagnoses" folder inside "Actual" and share it
+        diagnoses_folder = find_folder_by_name(drive_service, actual_folder_id, "Diagnoses", auto_share=True)
+        if not diagnoses_folder:
+            raise RuntimeError(
+                f"Folder 'Diagnoses' not found in 'Campaigns/{task_type}/Actual/'. "
+                f"Please ensure the folder structure exists in Google Drive."
+            )
+    else:
+        # For Theme and New Creative: Campaigns/[Task Type]/Diagnoses/
+        diagnoses_folder = find_folder_by_name(drive_service, task_type_folder_id, "Diagnoses", auto_share=True)
+        if not diagnoses_folder:
+            raise RuntimeError(
+                f"Folder 'Diagnoses' not found in '{task_type}' folder. "
+                f"Please ensure the folder structure 'Campaigns/{task_type}/Diagnoses/' exists in Google Drive."
+            )
+    
+    diagnoses_folder_id = diagnoses_folder["id"]
+    
+    # Step 4: Upload text file to Diagnoses folder
+    file_metadata = {
+        "name": file_name,
+        "parents": [diagnoses_folder_id]
+    }
+    
+    # Convert text content to bytes
+    text_content_bytes = content.encode('utf-8')
+    
+    media = MediaIoBaseUpload(
+        io.BytesIO(text_content_bytes),
+        mimetype="text/plain",
+        resumable=True
+    )
+    
+    file = drive_service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id, name, mimeType, modifiedTime, createdTime"
+    ).execute()
+    
+    print(f"[Document Storage] Uploaded text document: {file_name} (id={file['id']})")
+    
+    # Build folder path for return value
+    if task_type.lower() == "campaign update":
+        folder_path = "Campaigns/Campaign Update/Actual/Diagnoses/"
+    else:
+        folder_path = f"Campaigns/{task_type}/Diagnoses/"
+    
+    return {
+        "file_id": file["id"],
+        "file_name": file["name"],
+        "file_metadata": file,
+        "folder_path": folder_path
+    }
 
 
 def extract_text_for_file(mime_type: str, content: bytes, file_meta: Optional[Dict[str, Any]] = None) -> tuple[str, Optional[Dict[str, Any]]]:
@@ -691,6 +1372,7 @@ def ensure_qdrant_collection(
         "file_type": qmodels.PayloadSchemaType.KEYWORD,
         "task_type": qmodels.PayloadSchemaType.KEYWORD,  # For campaign metadata filtering
         "dealership_name": qmodels.PayloadSchemaType.KEYWORD,  # For campaign metadata filtering
+        "status": qmodels.PayloadSchemaType.KEYWORD,  # For diagnosis filtering by status
     }
     
     for field_name, field_schema in required_indexes.items():
@@ -841,7 +1523,6 @@ def embed_text(texts: List[str]) -> List[List[float]]:
     embedding_model = EMBEDDING_MODEL
     
     try:
-        from openai import OpenAI
         client = OpenAI()
         
         # Batch process texts (OpenAI API handles batching efficiently)
@@ -851,13 +1532,10 @@ def embed_text(texts: List[str]) -> List[List[float]]:
         )
         return [d.embedding for d in resp.data]
     
-    except ImportError:
+    except (ImportError, NameError):
         print("[WARN] OpenAI library not available. Using fallback hash-based embeddings.")
         print("       Install with: pip install openai")
         # Fallback to hash-based embeddings if OpenAI is not available
-        import hashlib
-        import math
-
         vectors: List[List[float]] = []
         for t in texts:
             h = hashlib.sha256(t.encode("utf-8")).digest()
@@ -876,9 +1554,6 @@ def embed_text(texts: List[str]) -> List[List[float]]:
         print(f"[ERROR] Failed to generate embeddings: {e}")
         print("       Falling back to hash-based embeddings.")
         # Fallback to hash-based embeddings on error
-        import hashlib
-        import math
-
         vectors: List[List[float]] = []
         for t in texts:
             h = hashlib.sha256(t.encode("utf-8")).digest()
@@ -1079,7 +1754,6 @@ def _process_spreadsheet_files(
 
         except Exception as e:
             print(f"      [ERROR] Failed to process {file_name} (id={file_id}): {e}")
-            import traceback
             traceback.print_exc()
     
     return processed_count
@@ -1274,4 +1948,172 @@ def sync_from_gdrive_folder(
             print("       Only processing documentation files in the outer folder.")
 
     print(f"\nSync completed. Processed {processed_count} file(s).")
+    return processed_count
+
+
+def sync_diagnoses_from_gdrive_folder(
+    main_drive_folder_id: str,
+    collection_name: str,
+    drive_service: Optional[Any] = None,
+    qdrant_client: Optional[QdrantClient] = None,
+) -> int:
+    """
+    Sync diagnosis spreadsheets from Google Drive to Qdrant.
+    Scans Campaigns/[Task Type]/Diagnoses/ folders and stores diagnosis metadata in Qdrant.
+    
+    Args:
+        main_drive_folder_id: ID of the main Google Drive folder containing "Campaigns" folder
+        collection_name: Name of the Qdrant collection
+        drive_service: Optional Google Drive service (will be created if None)
+        qdrant_client: Optional Qdrant client (will be created if None)
+    
+    Returns:
+        Number of diagnosis files processed
+    """
+    if drive_service is None:
+        drive_service = get_drive_service()
+    
+    if qdrant_client is None:
+        qdrant_client = get_qdrant_client()
+    
+    # Ensure collection exists with correct vector size
+    ensure_qdrant_collection(qdrant_client, collection_name)
+    
+    processed_count = 0
+    
+    # Find "Campaigns" folder
+    campaigns_folder = find_folder_by_name(drive_service, main_drive_folder_id, "Campaigns")
+    if not campaigns_folder:
+        print(f"[Diagnosis Sync] 'Campaigns' folder not found in {main_drive_folder_id}, skipping diagnosis sync.")
+        return 0
+    
+    campaigns_folder_id = campaigns_folder["id"]
+    print(f"[Diagnosis Sync] Found 'Campaigns' folder (id={campaigns_folder_id})")
+    
+    # Task type folders to scan
+    task_type_folders = ["Campaign Update", "New Creative", "Theme"]
+    xlsx_mime_type = ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]
+    
+    for task_type_name in task_type_folders:
+        task_type_folder = find_folder_by_name(drive_service, campaigns_folder_id, task_type_name)
+        
+        if not task_type_folder:
+            print(f"[Diagnosis Sync] Task type folder '{task_type_name}' not found, skipping.")
+            continue
+        
+        task_type_folder_id = task_type_folder["id"]
+        print(f"\n[Diagnosis Sync] Processing task type folder: '{task_type_name}' (id={task_type_folder_id})")
+        
+        # For "Campaign Update", look inside "Actual" folder first, then "Diagnoses"
+        # For other task types, look directly in "Diagnoses" folder
+        if task_type_name == "Campaign Update":
+            # Find "Actual" subfolder first
+            actual_folder = find_folder_by_name(drive_service, task_type_folder_id, "Actual")
+            if not actual_folder:
+                print(f"[Diagnosis Sync] 'Actual' folder not found in '{task_type_name}', skipping.")
+                continue
+            
+            actual_folder_id = actual_folder["id"]
+            print(f"[Diagnosis Sync] Found 'Actual' folder (id={actual_folder_id})")
+            
+            # Find "Diagnoses" subfolder inside "Actual"
+            diagnoses_folder = find_folder_by_name(drive_service, actual_folder_id, "Diagnoses")
+            folder_path_prefix = f"{task_type_name}/Actual"
+        else:
+            # For other task types, find "Diagnoses" directly under task type folder
+            diagnoses_folder = find_folder_by_name(drive_service, task_type_folder_id, "Diagnoses")
+            folder_path_prefix = task_type_name
+        
+        if not diagnoses_folder:
+            print(f"[Diagnosis Sync] 'Diagnoses' folder not found in '{folder_path_prefix}', skipping.")
+            continue
+        
+        diagnoses_folder_id = diagnoses_folder["id"]
+        print(f"[Diagnosis Sync] Found 'Diagnoses' folder (id={diagnoses_folder_id})")
+        
+        # List all Excel files in Diagnoses folder
+        diagnosis_files = list_files_in_folder(drive_service, diagnoses_folder_id, file_types=xlsx_mime_type)
+        print(f"[Diagnosis Sync] Found {len(diagnosis_files)} diagnosis spreadsheet(s) in 'Campaigns/{folder_path_prefix}/Diagnoses'")
+        
+        for f in diagnosis_files:
+            file_id = f["id"]
+            file_name = f["name"]
+            
+            if not needs_update(qdrant_client, collection_name, f):
+                print(f"      [SKIP] {file_name} (id={file_id}) is up to date.")
+                continue
+            
+            print(f"      [UPDATE] Processing diagnosis file: {file_name} (id={file_id})")
+            
+            try:
+                content = download_file_content(drive_service, file_id, f["mimeType"])
+                
+                # Extract diagnosis metadata
+                metadata, compact_text = extract_diagnosis_metadata(content, f)
+                
+                if not compact_text.strip():
+                    print(f"      [WARN] No metadata extracted from {file_name}, skipping.")
+                    continue
+                
+                # Create a single embedding for the entire diagnosis spreadsheet metadata
+                embedding = embed_text([compact_text])[0]
+                
+                # Build payload with metadata
+                payload = {
+                    "file_type": "campaign_diagnosis",
+                    "file_id": file_id,
+                    "file_name": metadata["file_name"],
+                    "task_type": metadata["task_type"],
+                    "dealership_name": metadata["dealership_name"],
+                    "statuses": metadata["statuses"],  # List of unique statuses
+                    "campaign_ids": metadata["campaign_ids"],
+                    "total_diagnoses": metadata["total_diagnoses"],
+                    "diagnosis_date": metadata["diagnosis_date"],
+                    "qa_result": metadata["qa_result"],
+                    "file_modified_time": metadata["file_modified_time"],
+                    "folder_path": f"Campaigns/{folder_path_prefix}/Diagnoses/",
+                    "text": compact_text,
+                    "page_content": compact_text,  # For LangChain compatibility
+                }
+                
+                # Use file_id as the unique identifier (single point per diagnosis spreadsheet)
+                point_id = uuid5(NAMESPACE_URL, f"campaign_diagnosis_{file_id}")
+                
+                # Retry logic for single point upsert
+                for attempt in range(QDRANT_MAX_RETRIES):
+                    try:
+                        qdrant_client.upsert(
+                            collection_name=collection_name,
+                            points=qmodels.Batch(
+                                ids=[point_id],
+                                vectors=[embedding],
+                                payloads=[payload],
+                            ),
+                        )
+                        break
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        is_timeout = "timeout" in error_msg or "timed out" in error_msg
+                        
+                        if attempt < QDRANT_MAX_RETRIES - 1:
+                            wait_time = QDRANT_RETRY_DELAY * (attempt + 1)
+                            print(f"      [RETRY] Attempt {attempt + 1}/{QDRANT_MAX_RETRIES} failed: {e}")
+                            if is_timeout:
+                                print(f"      [RETRY] Timeout detected. Retrying in {wait_time} seconds...")
+                            time.sleep(wait_time)
+                        else:
+                            raise Exception(f"Failed to upsert diagnosis metadata after {QDRANT_MAX_RETRIES} attempts: {e}")
+                
+                print(
+                    f"      [OK] Indexed diagnosis metadata for {file_name} "
+                    f"({metadata['total_diagnoses']} diagnoses) "
+                    f"into collection '{collection_name}'"
+                )
+                processed_count += 1
+                
+            except Exception as e:
+                print(f"      [ERROR] Failed to process {file_name} (id={file_id}): {e}")
+                traceback.print_exc()
+    
+    print(f"\nDiagnosis sync completed. Processed {processed_count} file(s).")
     return processed_count

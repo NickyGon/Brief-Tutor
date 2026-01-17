@@ -3,6 +3,7 @@ Main execution script for the Campaign Brief workflow.
 """
 import os
 import json
+import traceback
 from pathlib import Path
 from dotenv import load_dotenv
 from graph.workflow import create_campaign_workflow
@@ -87,12 +88,6 @@ def main():
             # Pretty print the structured results
             print(json.dumps(final_results, indent=2, ensure_ascii=False))
             
-            # Also save to file for easy access
-            output_file = "workflow_results.json"
-            with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(final_results, f, indent=2, ensure_ascii=False)
-            print(f"\n💾 Results saved to: {output_file}")
-            
         else:
             print("\n⚠️  No final_results found in the workflow output.")
             print("Final state keys:", list(final_state.keys()))
@@ -136,7 +131,6 @@ def main():
         print(f"❌ ERROR: Workflow execution failed")
         print("=" * 80)
         print(f"\nError details: {str(e)}")
-        import traceback
         traceback.print_exc()
         raise
 

@@ -4,28 +4,28 @@ overview: Implement a RAG memory system that stores campaign diagnoses in Qdrant
 todos:
   - id: extract_diagnosis_metadata
     content: Create extract_diagnosis_metadata() function in rag_ingestion.py to parse diagnosis spreadsheets (one row per diagnosis) and extract metadata
-    status: pending
+    status: completed
   - id: store_diagnoses_to_drive
     content: Create store_diagnoses_to_drive() function in rag_ingestion.py to auto-store diagnoses as Excel spreadsheet in Google Drive after QA passes
-    status: pending
+    status: completed
   - id: sync_diagnoses_function
     content: Create sync_diagnoses_from_gdrive_folder() function in rag_ingestion.py to sync diagnosis spreadsheets from Google Drive to Qdrant
-    status: pending
+    status: completed
   - id: find_similar_diagnoses_tool
     content: Create find_similar_diagnoses() tool in graph/tools.py for QA agent to retrieve similar past diagnoses
-    status: pending
+    status: completed
   - id: update_qdrant_indexes
     content: Update ensure_qdrant_collection() in rag_ingestion.py to include status payload index
-    status: pending
+    status: completed
   - id: add_tool_to_qa
     content: Update get_available_tools() in graph/tools.py to add find_similar_diagnoses to QA agent tools
-    status: pending
+    status: completed
   - id: update_qa_agent_prompt
     content: Update qa_agent.yaml prompt to instruct using find_similar_diagnoses tool for better judgment
-    status: pending
+    status: completed
   - id: integrate_auto_storage
     content: Update workflow.py QA agent node to automatically store diagnoses to Google Drive after QA passes
-    status: pending
+    status: completed
 ---
 
 # RAG Memory System for Campaign Diagnoses (Spreadsheet-Based)
@@ -78,8 +78,6 @@ The system will:
 }
 ```
 
-
-
 ### 2. Create Diagnosis Storage Function (`rag_ingestion.py`)
 
 **File:** `rag_ingestion.py`Create `store_diagnoses_to_drive()` function:
@@ -103,8 +101,6 @@ Main Drive Folder/
     └── Campaign Update/
         └── Diagnoses/
 ```
-
-
 
 ### 3. Create Diagnosis Sync Function (`rag_ingestion.py`)
 
@@ -140,8 +136,6 @@ def find_similar_diagnoses(
     collection_name: Optional[str] = None
 ) -> str
 ```
-
-
 
 ### 5. Update Qdrant Collection Setup (`rag_ingestion.py`)
 
@@ -196,8 +190,6 @@ agents/qa_agent.yaml
 └── prompt  # UPDATE: Add instructions to use find_similar_diagnoses
 ```
 
-
-
 ## Data Flow
 
 ```javascript
@@ -218,21 +210,4 @@ agents/qa_agent.yaml
 8. Re-sync updates Qdrant with edited diagnoses
 ```
 
-
-
 ## Spreadsheet Format
-
-**Diagnosis Spreadsheet Structure:**| campaign_id | status | diagnosis | issues | recommendations | task_type | dealership_name | diagnosis_date | qa_result ||-------------|--------|-----------|--------|-----------------|-----------|-----------------|----------------|-----------|| Content 1 | passed | Campaign complies... | [] | [] | New Creative | Example Dealership | 2025-01-15T10:30:00Z | true || Content 2 | critical | Missing headline... | ["Missing headline"] | ["Add headline"] | New Creative | Example Dealership | 2025-01-15T10:30:00Z | true |**Notes:**
-
-- `issues` and `recommendations` can be JSON arrays or comma-separated strings
-- `diagnosis_date` in ISO format
-- `qa_result` is boolean (true/false)
-
-## Testing Considerations
-
-- Test diagnosis metadata extraction from spreadsheets
-- Test auto-storage to Google Drive after QA passes
-- Test syncing from Google Drive diagnosis spreadsheets
-- Test `find_similar_diagnoses` tool with various filters
-- Test QA agent integration
-- Verify payload indexes work correctly

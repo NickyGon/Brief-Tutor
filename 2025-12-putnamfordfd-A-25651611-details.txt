@@ -1,0 +1,28 @@
+📊 Campaign Diagnoses Data
+🗒️Task Type: New Creative
+📝Number of Campaigns: 4
+🏠Dealership: Heritage Valley Ford
+
+Campaign ID: Content 1
+Status: critical
+Diagnosis: Offer expiration date is in the past relative to today (Offer expires 1/5/26; current date 2026-01-07). This violates expiration freshness guidelines and would prevent proper validation and live deployment without an updated date. Headline and CTA comply; Winter look and asset set are consistent.
+Issues: Offer expiration date is in the past (1/5/26).; Expiration date is not at least 15 days ahead of the QA date.
+Recommendations: Update the offer expiration to a future date (e.g., 2026-02-15 or later) to ensure a valid run window.; Re-run QA after updating the expiration date to verify compliance with the expiration guidelines.
+
+Campaign ID: Content 2
+Status: critical
+Diagnosis: Offer expiration date is in the past relative to today (Offer expires 1/5/26; current date 2026-01-07). This violates expiration freshness guidelines and would prevent proper validation and live deployment without an updated date. Headline and CTA comply; Winter look and asset set are consistent.
+Issues: Offer expiration is in the past (1/5/26).; Expiration date not at least 15 days ahead of the QA date.
+Recommendations: Update the offer expiration to a future date (e.g., 2026-02-15 or later).; Re-run QA after updating the expiration date to confirm compliance.
+
+Campaign ID: Content 3
+Status: critical
+Diagnosis: Offer expiration date is in the past relative to today (Offer expires 1/5/26; current date 2026-01-07). This violates expiration freshness guidelines and would prevent proper validation and live deployment without an updated date. Headline and CTA comply; Winter look and asset set are consistent.
+Issues: Offer expiration is in the past (1/5/26).; Expiration date not at least 15 days ahead of the QA date.
+Recommendations: Update the offer expiration to a future date (e.g., 2026-02-15 or later).; Re-run QA after updating the expiration date to ensure compliance.
+
+Campaign ID: Content 4
+Status: observed
+Diagnosis: Offer field is empty. While New Creative allows some fields to be empty, providing an offer strengthens the value proposition. No disclaimer is present either; these are optional but recommended for better clarity and performance.
+Issues: Offer field is empty.; No disclaimer present (optional but recommended).
+Recommendations: Provide a clear offer in the Offer field (e.g., specific financing or pricing detail).; Add a short disclaimer and expiration date if possible to improve clarity and compliance.

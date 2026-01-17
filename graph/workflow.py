@@ -3,13 +3,27 @@ Main LangGraph workflow for the agent.
 """
 from typing import Dict, Any, List, Optional
 from pathlib import Path
+from datetime import datetime
 import yaml
+import json
+import re
+import sys
+import traceback
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langchain.agents import create_agent
 from graph.models import AgentState, CampaignBrief, CampaignDiagnosis, Campaign, Assets, OfferDetails, StyleDescriptions
 from graph.tools import get_available_tools
+
+# Import from rag_ingestion (may need path adjustment)
+try:
+    import rag_ingestion
+    store_diagnoses_to_drive = rag_ingestion.store_diagnoses_to_drive
+except ImportError:
+    # Will be imported dynamically if needed
+    rag_ingestion = None
+    store_diagnoses_to_drive = None
 
 
 
@@ -53,8 +67,9 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
     node_name = config.get("name", "agent").lower().replace(" ", "_")
     
     # Create LLM with specified parameters
-    # Task-specific agents and QA agent need more tokens to generate/validate diagnoses for multiple campaigns
-    max_tokens = TASK_AGENT_MAX_TOKENS if node_name in ["theme_agent", "new_creative_agent", "campaign_update_agent", "qa_agent"] else DEFAULT_MAX_TOKENS
+    # Task-specific agents need more tokens to generate/validate diagnoses for multiple campaigns
+    # Document creator agent also needs more tokens to generate two full documents
+    max_tokens = TASK_AGENT_MAX_TOKENS if node_name in ["theme_agent", "new_creative_agent", "campaign_update_agent", "document_creator_agent"] else DEFAULT_MAX_TOKENS
     
     llm = ChatOpenAI(
         model=DEFAULT_MODEL,
@@ -110,7 +125,6 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
                 isinstance(msg, dict) and "campaign_brief" in str(msg.get("content", "")).lower() 
                 for msg in messages
             ):
-                import json
                 brief_info = {
                     "spreadsheet_path": state.campaign_brief.spreadsheet_path,
                     "task_type": state.campaign_brief.task_type,
@@ -154,9 +168,6 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
         updated_messages = messages.copy()
         updated_campaign_brief = state.campaign_brief
         updated_diagnoses = state.campaign_diagnoses
-        
-        import json
-        import re
         
         if response.get("messages"):
             for msg in response["messages"]:
@@ -258,7 +269,6 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
                             # Convert campaigns from dicts back to Campaign objects if needed
                             campaigns_data = tool_result.get("campaigns", [])
                             # Reconstruct Campaign objects if they're dicts
-                            from graph.models import Campaign
                             reconstructed_campaigns = []
                             for camp_data in campaigns_data:
                                 if isinstance(camp_data, dict):
@@ -291,7 +301,6 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
                             # If parsing fails, log the error for debugging
                             print(f"[ERROR] Failed to create CampaignBrief from tool result: {type(e).__name__}: {str(e)}")
                             print(f"       Tool result keys: {list(tool_result.keys()) if isinstance(tool_result, dict) else 'N/A'}")
-                            import traceback
                             traceback.print_exc()
                     
                     # Ensure tool_result is JSON serializable
@@ -423,7 +432,7 @@ def router_node(state: AgentState) -> Dict[str, Any]:
     Routing logic:
     - "Theme" → theme_agent
     - "New Creative" → new_creative_agent
-    - "Rework" or "Campaign Update" → campaign_update_agent
+    - "Campaign Update" → campaign_update_agent
     - Default (or unknown) → new_creative_agent
     
     Args:
@@ -449,7 +458,6 @@ def router_node(state: AgentState) -> Dict[str, Any]:
                     content = msg.get("content", "")
                     # Look for task_type in tool call results
                     if "task_type" in str(content).lower():
-                        import json
                         try:
                             if isinstance(content, str):
                                 parsed = json.loads(content)
@@ -472,7 +480,7 @@ def router_node(state: AgentState) -> Dict[str, Any]:
         next_node = "theme_agent"
     elif task_type_lower == "new creative":
         next_node = "new_creative_agent"
-    elif task_type_lower in ["rework", "campaign update"]:
+    elif task_type_lower == "campaign update":
         next_node = "campaign_update_agent"
     else:
         next_node = "new_creative_agent"  # Default fallback
@@ -485,29 +493,27 @@ def router_node(state: AgentState) -> Dict[str, Any]:
     }
 
 
-def qa_node(state: AgentState) -> Dict[str, Any]:
+def diagnosis_formatter_node(state: AgentState) -> Dict[str, Any]:
     """
-    QA node that reviews campaign diagnoses from the task type agent.
+    Diagnosis formatter node that validates diagnoses, formats them to Excel, and keeps them in state.
     
     Steps:
-    1. Extract campaign diagnoses from agent messages
-    2. Use QA agent to review diagnoses against RAG rules
-    3. Determine if rework is needed (max 3 attempts)
+    1. Structure validation (required fields, status values)
+    2. Lightweight RAG validation (quick check against rules)
+    3. Format to Excel using store_diagnoses_to_drive
+    4. Keep diagnoses in state for Document Creator Agent
+    5. Route based on validation result (max 3 rework attempts)
     
     Args:
         state: Current agent state with campaign diagnoses
         
     Returns:
-        Updated state with QA result and routing decision
+        Updated state with formatted diagnoses and routing decision
     """
-    # Extract diagnoses from the last agent's output
-    # The diagnoses should be in the messages from the task type agent
-    import json
-    import re
+    diagnoses = state.campaign_diagnoses or []
     
-    diagnoses = state.campaign_diagnoses
+    # Extract diagnoses from messages if not in state
     if not diagnoses and state.messages:
-        # Try to extract from messages
         for msg in reversed(state.messages):
             if isinstance(msg, dict):
                 content = msg.get("content", "")
@@ -516,7 +522,6 @@ def qa_node(state: AgentState) -> Dict[str, Any]:
                         parsed = json.loads(content)
                         if isinstance(parsed, dict) and "campaign_diagnoses" in parsed:
                             diagnoses_data = parsed["campaign_diagnoses"]
-                            # Convert dicts to CampaignDiagnosis objects
                             if isinstance(diagnoses_data, list):
                                 diagnoses = []
                                 for diag_data in diagnoses_data:
@@ -524,99 +529,89 @@ def qa_node(state: AgentState) -> Dict[str, Any]:
                                         diagnoses.append(CampaignDiagnosis(**diag_data))
                                     elif isinstance(diag_data, CampaignDiagnosis):
                                         diagnoses.append(diag_data)
-                            break
+                                break
                     except (json.JSONDecodeError, TypeError):
-                        # Check if content contains campaign_diagnoses as text
-                        if "campaign_diagnoses" in content.lower():
+                        json_match = re.search(r'\{.*"campaign_diagnoses".*\}', content, re.DOTALL)
+                        if json_match:
                             try:
-                                # Try to extract JSON from text
-                                json_match = re.search(r'\{.*"campaign_diagnoses".*\}', content, re.DOTALL)
-                                if json_match:
-                                    parsed = json.loads(json_match.group())
-                                    diagnoses_data = parsed.get("campaign_diagnoses")
-                                    if isinstance(diagnoses_data, list):
-                                        diagnoses = []
-                                        for diag_data in diagnoses_data:
-                                            if isinstance(diag_data, dict):
-                                                diagnoses.append(CampaignDiagnosis(**diag_data))
-                                            elif isinstance(diag_data, CampaignDiagnosis):
-                                                diagnoses.append(diag_data)
+                                parsed = json.loads(json_match.group())
+                                diagnoses_data = parsed.get("campaign_diagnoses")
+                                if isinstance(diagnoses_data, list):
+                                    diagnoses = []
+                                    for diag_data in diagnoses_data:
+                                        if isinstance(diag_data, dict):
+                                            diagnoses.append(CampaignDiagnosis(**diag_data))
+                                        elif isinstance(diag_data, CampaignDiagnosis):
+                                            diagnoses.append(diag_data)
                                     break
                             except:
                                 pass
     
-    # Get the QA agent
-    qa_agent = create_agent_from_config(
-        "agents/qa_agent.yaml",
-        get_available_tools("qa_agent")
-    )
-    
-    # Prepare state for QA agent
-    qa_state = state.model_copy()
-    if diagnoses:
-        qa_state.campaign_diagnoses = diagnoses
-    
-    # Invoke QA agent
-    qa_result = qa_agent(qa_state)
-    
-    # Extract QA result from QA agent's response
-    qa_passed = None
-    qa_feedback = None
-    updated_rework_count = state.rework_count or 0
-    
-    # Try to extract QA result from messages
-    if qa_result.get("messages"):
-        for msg in reversed(qa_result["messages"]):
-            if isinstance(msg, dict):
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    try:
-                        parsed = json.loads(content)
-                        if isinstance(parsed, dict):
-                            qa_passed = parsed.get("qa_result")
-                            qa_feedback = parsed.get("qa_feedback")
-                            if "rework_count" in parsed:
-                                updated_rework_count = parsed.get("rework_count", updated_rework_count)
-                            break
-                    except (json.JSONDecodeError, TypeError):
-                        # Check if content mentions pass/fail
-                        content_lower = content.lower()
-                        if "qa_result" in content_lower or "passed" in content_lower or "failed" in content_lower:
-                            # Try to extract boolean from text
-                            if "true" in content_lower or "passed" in content_lower:
-                                qa_passed = True
-                            elif "false" in content_lower or "failed" in content_lower:
-                                qa_passed = False
-                                qa_feedback = content
-                            break
-    
-    # If QA passed or max reworks reached, go to final_results node
-    # Otherwise, route back to the task type agent for rework
-    if qa_passed is True:
-        print(f"[QA] QA passed. Proceeding to final_results.")
+    if not diagnoses:
+        print("[Diagnosis Formatter] ⚠️  No diagnoses found in state")
         return {
-            "qa_result": True,
-            "qa_feedback": qa_feedback or "QA passed successfully",
             "next": "final_results",
-            "next_node": "qa_agent",
-            "campaign_diagnoses": diagnoses,
-            "rework_count": updated_rework_count
+            "next_node": "diagnosis_formatter",
+            "campaign_diagnoses": []
         }
-    elif updated_rework_count >= 3:
-        print(f"[QA] Max reworks ({updated_rework_count}) reached. Using latest diagnoses and proceeding to final_results.")
-        return {
-            "qa_result": False,
-            "qa_feedback": qa_feedback or "Max reworks reached, using latest diagnoses",
-            "next": "final_results",
-            "next_node": "qa_agent",
-            "campaign_diagnoses": diagnoses,
-            "rework_count": updated_rework_count
-        }
-    else:
-        # Need rework - route back to the task type agent
-        updated_rework_count += 1
+    
+    # 1. Structure validation
+    validation_errors = []
+    for i, diag in enumerate(diagnoses):
+        if isinstance(diag, dict):
+            campaign_id = diag.get("campaign_id", "")
+            status = diag.get("status", "")
+            diagnosis = diag.get("diagnosis", "")
+            issues = diag.get("issues", [])
+            recommendations = diag.get("recommendations", [])
+        elif isinstance(diag, CampaignDiagnosis):
+            campaign_id = diag.campaign_id
+            status = diag.status
+            diagnosis = diag.diagnosis
+            issues = diag.issues or []
+            recommendations = diag.recommendations or []
+        else:
+            validation_errors.append(f"Diagnosis {i+1}: Invalid format")
+            continue
         
-        # Determine which agent to route back to based on campaign_brief.task_type
+        # Check required fields
+        if not campaign_id:
+            validation_errors.append(f"Diagnosis {i+1}: Missing campaign_id")
+        if not diagnosis:
+            validation_errors.append(f"Diagnosis {i+1}: Missing diagnosis")
+        if not status:
+            validation_errors.append(f"Diagnosis {i+1}: Missing status")
+        elif status not in ["critical", "observed", "passed"]:
+            validation_errors.append(f"Diagnosis {i+1}: Invalid status '{status}' (must be 'critical', 'observed', or 'passed')")
+        
+        # Validate issues and recommendations are lists
+        if not isinstance(issues, list):
+            validation_errors.append(f"Diagnosis {i+1}: Issues must be a list")
+        if not isinstance(recommendations, list):
+            validation_errors.append(f"Diagnosis {i+1}: Recommendations must be a list")
+    
+    # 2. Lightweight RAG validation (quick check)
+    # This is a basic check - full validation was done by task agents during self-validation
+    validation_passed = len(validation_errors) == 0
+    
+    if not validation_passed:
+        print(f"[Diagnosis Formatter] ⚠️  Validation failed with {len(validation_errors)} errors:")
+        for error in validation_errors[:5]:  # Show first 5 errors
+            print(f"  - {error}")
+        
+        # Route back to task agent for rework
+        updated_rework_count = (state.rework_count or 0) + 1
+        
+        if updated_rework_count >= 3:
+            print(f"[Diagnosis Formatter] Max reworks ({updated_rework_count}) reached. Proceeding to final_results.")
+            return {
+                "next": "final_results",
+                "next_node": "diagnosis_formatter",
+                "campaign_diagnoses": diagnoses,
+                "rework_count": updated_rework_count
+            }
+        
+        # Determine which agent to route back to
         task_type_agent = "new_creative_agent"  # default
         if state.campaign_brief and state.campaign_brief.task_type:
             task_type_lower = state.campaign_brief.task_type.lower().strip()
@@ -624,28 +619,407 @@ def qa_node(state: AgentState) -> Dict[str, Any]:
                 task_type_agent = "theme_agent"
             elif task_type_lower == "new creative":
                 task_type_agent = "new_creative_agent"
-            elif task_type_lower in ["rework", "campaign update"]:
+            elif task_type_lower == "campaign update":
                 task_type_agent = "campaign_update_agent"
         
-        print(f"[QA] QA failed (attempt {updated_rework_count}/3). Routing back to {task_type_agent} for rework.")
-        print(f"[QA] Feedback: {qa_feedback}")
+        print(f"[Diagnosis Formatter] Validation failed (attempt {updated_rework_count}/3). Routing back to {task_type_agent} for rework.")
         
-        # Add feedback message for the agent to see
+        # Add feedback message
         updated_messages = state.messages.copy() if state.messages else []
+        feedback_text = "Validation failed. Issues found:\n" + "\n".join(validation_errors[:10])
         updated_messages.append({
             "role": "system",
-            "content": f"QA Review (Attempt {updated_rework_count}/3): {qa_feedback or 'QA check failed. Please review and improve the diagnoses.'}\n\nIMPORTANT: The campaign brief is already in the workflow state. DO NOT call load_and_parse_spreadsheet - use the existing campaign_brief data from the previous messages."
+            "content": f"⚠️ REWORK MODE (Attempt {updated_rework_count}/3) ⚠️\n\nDiagnosis Formatter Validation Feedback:\n{feedback_text}\n\nPlease fix the validation errors and resubmit your diagnoses."
         })
         
         return {
-            "qa_result": False,
-            "qa_feedback": qa_feedback,
             "next": task_type_agent,
-            "next_node": "qa_agent",
+            "next_node": "diagnosis_formatter",
             "campaign_diagnoses": diagnoses,
             "rework_count": updated_rework_count,
             "messages": updated_messages
         }
+    
+    # 3. Save diagnoses locally as JSON file
+    print(f"[Diagnosis Formatter] ✓ Validation passed. Saving {len(diagnoses)} diagnoses locally as JSON...")
+    
+    try:
+        # Extract filename from spreadsheet_path
+        spreadsheet_path = state.campaign_brief.spreadsheet_path if state.campaign_brief else ""
+        filename_base = ""
+        
+        if spreadsheet_path:
+            # Extract filename from path (handle both local paths and URLs)
+            if "/" in spreadsheet_path:
+                filename_base = spreadsheet_path.split("/")[-1]
+            elif "\\" in spreadsheet_path:
+                filename_base = spreadsheet_path.split("\\")[-1]
+            else:
+                filename_base = spreadsheet_path
+            
+            # Remove extension if present
+            if "." in filename_base:
+                filename_base = filename_base.rsplit(".", 1)[0]
+        
+        if not filename_base:
+            # Fallback: use date-based filename
+            current_date = datetime.now()
+            date_str = current_date.strftime("%Y-%m-%d")
+            filename_base = f"{date_str}-diagnoses"
+        
+        # Create output filename: [filename]-diagnoses.json
+        output_filename = f"{filename_base}-diagnoses.json"
+        
+        # Convert diagnoses to JSON-serializable format
+        diagnoses_list = []
+        for diag in diagnoses:
+            if isinstance(diag, CampaignDiagnosis):
+                diagnoses_list.append({
+                    "campaign_id": diag.campaign_id,
+                    "status": diag.status,
+                    "diagnosis": diag.diagnosis,
+                    "issues": diag.issues or [],
+                    "recommendations": diag.recommendations or []
+                })
+            elif isinstance(diag, dict):
+                diagnoses_list.append(diag)
+        
+        # Prepare output data
+        output_data = {
+            "task_type": state.campaign_brief.task_type if state.campaign_brief else None,
+            "dealership_name": state.campaign_brief.dealership_name if state.campaign_brief else None,
+            "asset_summary": state.campaign_brief.asset_summary if state.campaign_brief else None,
+            "spreadsheet_path": spreadsheet_path,
+            "diagnosis_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total_campaigns": len(diagnoses_list),
+            "campaign_diagnoses": diagnoses_list
+        }
+        
+        # Save to local file
+        project_root = Path(__file__).parent.parent
+        output_path = project_root / output_filename
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, indent=2, ensure_ascii=False)
+        
+        print(f"[Diagnosis Formatter] ✓ Diagnoses saved locally: {output_path}")
+        print(f"     File: {output_filename}")
+        
+        # Display the JSON content
+        print(f"\n[Diagnosis Formatter] 📄 Diagnoses JSON Content:")
+        print("-" * 80)
+        print(json.dumps(output_data, indent=2, ensure_ascii=False))
+        print("-" * 80)
+            
+    except Exception as e:
+        # Log error but don't fail the workflow if storage fails
+        print(f"[Diagnosis Formatter] Warning: Failed to save diagnoses locally: {e}")
+        traceback.print_exc()
+        output_path = None
+        output_filename = None
+    
+    # Store the JSON file path in state for Document Creator Agent
+    # Route to document_creator_agent (which will read from the JSON file and create text documents)
+    if output_path:
+        print(f"\n[Diagnosis Formatter] ✓ JSON file created. Proceeding to document_creator_agent to create text documents.")
+    else:
+        print(f"\n[Diagnosis Formatter] ⚠️  JSON file creation failed. Proceeding to document_creator_agent anyway (it will handle the error).")
+    return {
+        "next": "document_creator_agent",
+        "next_node": "diagnosis_formatter",
+        "diagnoses_json_path": str(output_path) if output_path else None,  # Pass path to JSON file
+        "rework_count": state.rework_count or 0
+    }
+
+
+def document_creator_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Document creator node that reads diagnoses from JSON file, invokes the document creator agent
+    to generate brief resume and full diagnoses listing documents, then saves them locally.
+    
+    Args:
+        state: Current agent state with diagnoses_json_path
+        
+    Returns:
+        Updated state with document metadata and routing to final_results
+    """
+    print(f"\n[Document Creator] Starting document creation process...")
+    
+    # Get the JSON file path from state
+    diagnoses_json_path = getattr(state, 'diagnoses_json_path', None)
+    if not diagnoses_json_path:
+        # Try to get from state dict if it's a dict
+        if isinstance(state, dict):
+            diagnoses_json_path = state.get('diagnoses_json_path')
+        else:
+            diagnoses_json_path = None
+    
+    if not diagnoses_json_path or not Path(diagnoses_json_path).exists():
+        print(f"[Document Creator] ⚠️  ERROR: Diagnoses JSON file not found!")
+        print(f"     Expected path: {diagnoses_json_path}")
+        print(f"     Cannot create documents without diagnosis data.")
+        return {
+            "next": "final_results",
+            "next_node": "document_creator_agent",
+            "messages": state.messages if hasattr(state, 'messages') else []
+        }
+    
+    print(f"[Document Creator] 📖 Reading diagnoses from JSON file: {diagnoses_json_path}")
+    
+    # Read the diagnoses JSON file
+    try:
+        with open(diagnoses_json_path, 'r', encoding='utf-8') as f:
+            diagnoses_json = json.load(f)
+        
+        diagnoses_data = diagnoses_json.get("campaign_diagnoses", [])
+        task_type = diagnoses_json.get("task_type")
+        dealership_name = diagnoses_json.get("dealership_name")
+        spreadsheet_path = diagnoses_json.get("spreadsheet_path")
+        
+        print(f"[Document Creator] ✓ Loaded {len(diagnoses_data)} diagnoses from JSON file")
+        print(f"     Task Type: {task_type}")
+        print(f"     Dealership: {dealership_name}")
+        
+    except Exception as e:
+        print(f"[Document Creator] ⚠️  ERROR: Failed to read diagnoses JSON file: {e}")
+        traceback.print_exc()
+        return {
+            "next": "final_results",
+            "next_node": "document_creator_agent",
+            "messages": state.messages if hasattr(state, 'messages') else []
+        }
+    
+    # Get the document creator agent
+    document_creator_agent = create_agent_from_config(
+        "agents/document_creator_agent.yaml",
+        get_available_tools("document_creator_agent")
+    )
+    
+    # Prepare state for the agent
+    agent_state = state.model_copy()
+    if agent_state.messages is None:
+        agent_state.messages = []
+    
+    # Count campaigns by status for reference
+    critical_count = sum(1 for d in diagnoses_data if d.get("status") == "critical")
+    observed_count = sum(1 for d in diagnoses_data if d.get("status") == "observed")
+    passed_count = sum(1 for d in diagnoses_data if d.get("status") == "passed")
+    total_count = len(diagnoses_data)
+    
+    print(f"[Document Creator] 📊 Campaign counts: Critical={critical_count}, Observed={observed_count}, Passed={passed_count}, Total={total_count}")
+    
+    # Extract filename base from the JSON file path (which was created by diagnosis formatter)
+    filename_base = ""
+    if diagnoses_json_path:
+        json_filename = Path(diagnoses_json_path).name
+        # Remove "-diagnoses.json" suffix to get base filename
+        if json_filename.endswith("-diagnoses.json"):
+            filename_base = json_filename[:-len("-diagnoses.json")]
+        elif json_filename.endswith(".json"):
+            filename_base = json_filename[:-5]
+        else:
+            filename_base = json_filename
+    
+    if not filename_base:
+        # Fallback: use spreadsheet path from JSON
+        if spreadsheet_path:
+            if "/" in spreadsheet_path:
+                filename_base = spreadsheet_path.split("/")[-1]
+            elif "\\" in spreadsheet_path:
+                filename_base = spreadsheet_path.split("\\")[-1]
+            else:
+                filename_base = spreadsheet_path
+            
+            if "." in filename_base:
+                filename_base = filename_base.rsplit(".", 1)[0]
+    
+    if not filename_base:
+        current_date = datetime.now()
+        date_str = current_date.strftime("%Y-%m-%d")
+        filename_base = f"{date_str}-diagnoses"
+    
+    print(f"[Document Creator] 📝 Using filename base: {filename_base}")
+    
+    diagnoses_message = {
+        "role": "user",
+        "content": f"""You must create the Brief Resume and Full Diagnoses Listing documents using the ACTUAL diagnosis data below.
+
+IMPORTANT: Use ONLY the data provided below. Do NOT use example or template text.
+
+Campaign Diagnoses Data (use this exact data):
+{json.dumps(diagnoses_data, indent=2)}
+
+Campaign Brief Metadata:
+- Task Type: {task_type or 'N/A'}
+- Dealership Name: {dealership_name or 'N/A'}
+- Spreadsheet Path: {spreadsheet_path or 'N/A'}
+
+Reference counts (verify these match the data above):
+- Critical: {critical_count}
+- Observed: {observed_count}
+- Passed: {passed_count}
+- Total: {total_count}
+
+CRITICAL INSTRUCTIONS:
+1. For the Brief Resume:
+   - Use the template format: 📊 Campaign Brief Diagnosis Summary, then separator lines, then emoji stats
+   - Fill in the numbers: 🔴 {critical_count} / {total_count}, 🟡 {observed_count} / {total_count}, 🟢 {passed_count} / {total_count}
+   - List each campaign from the "Campaign Diagnoses Data" above using its ACTUAL campaign_id field
+   - For each campaign, use the ACTUAL issues array and recommendations array from that diagnosis object
+   - Do NOT use example campaign IDs like "12345" or "67890" - use the real campaign_id values from the data
+
+2. For the Full Listing:
+   - List ALL campaigns from the "Campaign Diagnoses Data" above
+   - For each campaign, include: campaign_id, status, diagnosis, issues, recommendations from the data
+   - Use the actual values from the JSON data provided
+
+3. Use the `write_document_to_file` tool to save both documents:
+   - Filename base: {filename_base}
+   - Call the tool TWICE:
+     * First call: file_name="{filename_base}-resume.txt", document_type="brief_resume", content=[your generated brief resume text]
+     * Second call: file_name="{filename_base}-details.txt", document_type="full_listing", content=[your generated full listing text]
+   - Generate the complete document content before calling the tool
+   - Use the ACTUAL data from the Campaign Diagnoses Data above
+
+DO NOT copy example text. Generate everything from the actual diagnosis data provided above."""
+    }
+    
+    # Add the message to the state
+    agent_state.messages = agent_state.messages + [diagnoses_message]
+    
+    # Verify tools are available
+    tools_list = get_available_tools("document_creator_agent")
+    tool_names = [tool.name if hasattr(tool, 'name') else str(tool) for tool in tools_list]
+    print(f"[Document Creator] 🔧 Available tools: {tool_names}")
+    
+    # Invoke the agent
+    print(f"[Document Creator] 🤖 Invoking document creator agent to generate and write documents...")
+    result = document_creator_agent(agent_state)
+    print(f"[Document Creator] ✓ Agent response received")
+    
+    # Debug: Print full response structure
+    print(f"[Document Creator] 🔍 Debugging agent response...")
+    if result.get("messages"):
+        print(f"     Total messages in response: {len(result['messages'])}")
+        for i, msg in enumerate(result["messages"]):
+            msg_type = type(msg).__name__ if not isinstance(msg, dict) else msg.get("role", "unknown")
+            print(f"     Message {i}: {msg_type}")
+            if isinstance(msg, dict):
+                print(f"       Keys: {list(msg.keys())}")
+                if "tool_calls" in msg:
+                    print(f"       Tool calls: {msg['tool_calls']}")
+                if "content" in msg:
+                    content_preview = str(msg["content"])[:200] if msg["content"] else "None"
+                    print(f"       Content preview: {content_preview}...")
+            elif hasattr(msg, 'tool_calls'):
+                print(f"       Tool calls attribute: {msg.tool_calls}")
+            elif hasattr(msg, 'content'):
+                content_preview = str(msg.content)[:200] if msg.content else "None"
+                print(f"       Content preview: {content_preview}...")
+    
+    # Check for tool calls in the agent response
+    # The agent should have called write_document_to_file twice (once for brief_resume, once for full_listing)
+    tool_calls_found = []
+    brief_resume_written = False
+    full_listing_written = False
+    
+    if result.get("messages"):
+        for msg in result["messages"]:
+            # Handle both dict and LangChain message objects
+            tool_calls = None
+            if isinstance(msg, dict):
+                tool_calls = msg.get("tool_calls", [])
+                role = msg.get("role", "")
+            else:
+                # LangChain message object
+                if hasattr(msg, 'tool_calls'):
+                    tool_calls = msg.tool_calls or []
+                role = getattr(msg, 'role', '')
+            
+            # Check for tool calls
+            if tool_calls:
+                print(f"[Document Creator] 🔍 Found {len(tool_calls)} tool call(s)")
+                for tool_call in tool_calls:
+                    # Handle both dict and LangChain tool call formats
+                    if isinstance(tool_call, dict):
+                        tool_name = tool_call.get("name", "")
+                        args = tool_call.get("args", {})
+                    else:
+                        tool_name = getattr(tool_call, 'name', '')
+                        args = getattr(tool_call, 'args', {}) or {}
+                    
+                    print(f"     Tool call: {tool_name} with args: {args}")
+                    if tool_name == "write_document_to_file":
+                        tool_calls_found.append(tool_call)
+                        doc_type = args.get("document_type", "") if isinstance(args, dict) else getattr(args, 'document_type', '')
+                        file_name = args.get("file_name", "") if isinstance(args, dict) else getattr(args, 'file_name', '')
+                        if doc_type == "brief_resume":
+                            brief_resume_written = True
+                            print(f"[Document Creator] ✓ Tool call detected: Brief Resume -> {file_name}")
+                        elif doc_type == "full_listing":
+                            full_listing_written = True
+                            print(f"[Document Creator] ✓ Tool call detected: Full Listing -> {file_name}")
+            
+            # Also check tool message responses (tool results)
+            if role == "tool" or (isinstance(msg, dict) and msg.get("role") == "tool"):
+                tool_name = ""
+                content = ""
+                if isinstance(msg, dict):
+                    tool_name = msg.get("name", "")
+                    content = msg.get("content", "")
+                else:
+                    tool_name = getattr(msg, 'name', '')
+                    content = getattr(msg, 'content', '')
+                
+                if "write_document_to_file" in str(tool_name).lower():
+                    try:
+                        if isinstance(content, str):
+                            tool_result = json.loads(content)
+                        else:
+                            tool_result = content
+                        if isinstance(tool_result, dict) and tool_result.get("success"):
+                            doc_type = tool_result.get("document_type", "")
+                            file_name = tool_result.get("file_name", "")
+                            if doc_type == "brief_resume":
+                                brief_resume_written = True
+                                print(f"[Document Creator] ✓ Tool result: Brief Resume written successfully -> {file_name}")
+                            elif doc_type == "full_listing":
+                                full_listing_written = True
+                                print(f"[Document Creator] ✓ Tool result: Full Listing written successfully -> {file_name}")
+                    except Exception as e:
+                        print(f"[Document Creator] ⚠️  Error parsing tool result: {e}")
+                        print(f"     Tool result content: {str(content)[:200]}")
+    
+    # Verify that both documents were written via tool calls
+    print(f"\n[Document Creator] 📋 Checking tool call results...")
+    
+    if brief_resume_written and full_listing_written:
+        print(f"[Document Creator] ✓ Both documents were written successfully via tool calls")
+        print(f"     - Brief Resume: Written via write_document_to_file tool")
+        print(f"     - Full Listing: Written via write_document_to_file tool")
+    else:
+        if not brief_resume_written:
+            print(f"[Document Creator] ⚠️  WARNING: Brief Resume was not written via tool call")
+            print(f"     The agent should have called write_document_to_file with document_type='brief_resume'")
+        if not full_listing_written:
+            print(f"[Document Creator] ⚠️  WARNING: Full Listing was not written via tool call")
+            print(f"     The agent should have called write_document_to_file with document_type='full_listing'")
+        
+        if tool_calls_found:
+            print(f"[Document Creator] Found {len(tool_calls_found)} tool call(s), but not all documents were written")
+        else:
+            print(f"[Document Creator] ⚠️  ERROR: No tool calls found in agent response")
+            print(f"     The agent should use the write_document_to_file tool to save both documents")
+            print(f"     Check the agent's response messages for errors or missing tool calls")
+    
+    print(f"\n[Document Creator] ✓ Document creation process complete. Proceeding to final_results.")
+    
+    return {
+        "next": "final_results",
+        "next_node": "document_creator_agent",
+        "campaign_diagnoses": state.campaign_diagnoses,  # Keep diagnoses
+        "messages": result.get("messages", state.messages)
+    }
 
 
 def final_results_node(state: AgentState) -> Dict[str, Any]:
@@ -658,7 +1032,6 @@ def final_results_node(state: AgentState) -> Dict[str, Any]:
     Returns:
         Updated state with final_results containing structured output
     """
-    import json
     
     campaign_brief = state.campaign_brief
     diagnoses = state.campaign_diagnoses or []
@@ -852,7 +1225,8 @@ def create_campaign_workflow() -> Any:
     workflow.add_node("theme_agent", theme_agent)
     workflow.add_node("new_creative_agent", new_creative_agent)
     workflow.add_node("campaign_update_agent", campaign_update_agent)
-    workflow.add_node("qa_agent", qa_node)
+    workflow.add_node("diagnosis_formatter", diagnosis_formatter_node)
+    workflow.add_node("document_creator_agent", document_creator_node)
     workflow.add_node("final_results", final_results_node)
     
     # Set entry point
@@ -891,35 +1265,42 @@ def create_campaign_workflow() -> Any:
         }
     )
     
-    # All task type agents go to QA node after processing
-    workflow.add_edge("theme_agent", "qa_agent")
-    workflow.add_edge("new_creative_agent", "qa_agent")
-    workflow.add_edge("campaign_update_agent", "qa_agent")
+    # All task type agents go to diagnosis_formatter after processing
+    workflow.add_edge("theme_agent", "diagnosis_formatter")
+    workflow.add_edge("new_creative_agent", "diagnosis_formatter")
+    workflow.add_edge("campaign_update_agent", "diagnosis_formatter")
     
-    # QA node routes based on result
-    def route_from_qa(state: AgentState) -> str:
+    # Diagnosis formatter routes based on validation result
+    def route_from_diagnosis_formatter(state: AgentState) -> str:
         """
-        Route from QA node based on QA result and rework count.
+        Route from diagnosis formatter based on validation result and rework count.
         
         Returns:
-            "final_results" if QA passed or max reworks reached
+            "document_creator_agent" if validation passed
+            "final_results" if max reworks reached
             The task type agent name if rework is needed
         """
-        if state.next == "final_results":
+        if state.next == "document_creator_agent":
+            return "document_creator_agent"
+        elif state.next == "final_results":
             return "final_results"
-        # Otherwise route back to the task type agent
+        # Otherwise route back to the task type agent for rework
         return state.next or "new_creative_agent"
     
     workflow.add_conditional_edges(
-        "qa_agent",
-        route_from_qa,
+        "diagnosis_formatter",
+        route_from_diagnosis_formatter,
         {
+            "document_creator_agent": "document_creator_agent",
             "final_results": "final_results",
             "theme_agent": "theme_agent",
             "new_creative_agent": "new_creative_agent",
             "campaign_update_agent": "campaign_update_agent"
         }
     )
+    
+    # Document creator agent always goes to final_results
+    workflow.add_edge("document_creator_agent", "final_results")
     
     # Final results node always ends the workflow
     workflow.add_edge("final_results", END)

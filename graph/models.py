@@ -118,3 +118,7 @@ class AgentState(BaseModel):
         default=None,
         description="Final structured results from the workflow"
     )
+    diagnoses_json_path: Optional[str] = Field(
+        default=None,
+        description="Path to the diagnoses JSON file created by the diagnosis formatter"
+    )

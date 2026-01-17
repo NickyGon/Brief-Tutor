@@ -1,0 +1,9 @@
+📊 Campaign Brief Diagnosis Summary
+Task Type: New Creative
+---------------
+🔴 3 / 4
+🟡 1 / 4
+🟢 0 / 4
+-------------------
+
+Content 1 requires attention due to an expired offer date and the expiration not being at least 15 days ahead of the QA date. Content 2 faces the same expiration-related risk, Content 3 also shows expiration freshness concerns, and Content 4 is observed for an empty Offer field and the absence of a disclaimer. In terms of actions, update the expiration on Content 1, Content 2, and Content 3 to future dates and re-run QA, while Content 4 should include a clear offer and add a disclaimer and expiration date to improve clarity and compliance.
