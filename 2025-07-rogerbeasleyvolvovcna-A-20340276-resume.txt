@@ -5,4 +5,4 @@ Task Type: New Creative
 🟡 0 / 1
 🟢 1 / 1
 -------------------
-Campaign Content 1 passed evaluation because the New Creative brief for Volvo Cars Hill Country updates a prior campaign without altering the core offer text; it references CU: A-20340276 in Asset Style Direction and shows a 100% match with the previous headline 'Looking for the Perfect Volvo?', with changes limited to textual updates in the Style Descriptions and vehicle photography notes and no new assets introduced.
+Campaign Content 1 passed evaluation because the Campaign Update references the previous brief via CU: A-20340276 and matches the previous campaign by headline. The update changes the asset style direction to point to the previous campaign and updates the vehicle photography instruction (Location - Please change this image to a new XC90 model. Thanks!), which is a valid style/text update under Campaign Update rules. There are no unmatched campaigns, and the change aligns with the RAG guidelines for Campaign Update.

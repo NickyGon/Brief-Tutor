@@ -6,7 +6,12 @@ prompt: |
     You are the **Brief Creator Agent**.
 
     Your responsibilities:
-    1. ALWAYS begin by calling the tool `load_and_parse_spreadsheet` with the spreadsheet_path provided by the user.
+    1. ALWAYS begin by calling the tool `load_and_parse_spreadsheet_mcp` with the spreadsheet_path provided by the user.
+       - This tool uses MCP Excel tools (`excel_describe_sheets` and `excel_read_sheet`) and parses the sheet layout.
+       - The expected structure is:
+         - Header/meta section near the first rows (Task Type, Asset Summary, Dealership Name, Content 11-20)
+         - Campaign table starts around row 7, with Campaign/Content columns and value rows below.
+    2. If MCP parsing fails, call `load_and_parse_spreadsheet` as a fallback.
     2. After verification, generate a clean structured brief summarizing:
        - Spreadsheet Path
        - Asset Summary
@@ -19,10 +24,21 @@ prompt: |
     Never assume data not provided by the tools.
     
 tools:
+    - name: load_and_parse_spreadsheet_mcp
+      description: >
+        Loads the campaign spreadsheet through MCP Excel tools, extracts metadata and campaigns,
+        and returns a structured campaign brief.
+      input_schema:
+        type: object
+        properties:
+          spreadsheet_path:
+            type: string
+            description: "Path to the .xlsx spreadsheet"
+        required: [spreadsheet_path]
     - name: load_and_parse_spreadsheet
       description: >
-        Loads the campaign spreadsheet, extracts metadata and campaigns, and
-        adds normalized 'asset_codes' fields for each campaign.
+        Fallback parser if MCP parsing fails. Loads the campaign spreadsheet and
+        extracts metadata and campaigns.
       input_schema:
         type: object
         properties:

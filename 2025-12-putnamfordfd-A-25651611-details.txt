@@ -4,25 +4,25 @@
 🏠Dealership: Heritage Valley Ford
 
 Campaign ID: Content 1
-Status: critical
-Diagnosis: Offer expiration date is in the past relative to today (Offer expires 1/5/26; current date 2026-01-07). This violates expiration freshness guidelines and would prevent proper validation and live deployment without an updated date. Headline and CTA comply; Winter look and asset set are consistent.
-Issues: Offer expiration date is in the past (1/5/26).; Expiration date is not at least 15 days ahead of the QA date.
-Recommendations: Update the offer expiration to a future date (e.g., 2026-02-15 or later) to ensure a valid run window.; Re-run QA after updating the expiration date to verify compliance with the expiration guidelines.
+Status: passed
+Diagnosis: Content 1 complies with New Creative guidelines. It has a clear Headline (2025 Ford F-150), a CTA (View Inventory), and a compliant Offer (0% APR for 60 months). The disclaimer is present and dated (expires 1/5/26). Asset Style Direction and Facebook assets are provided. Overall asset coverage is consistent with the asset summary. Self-validation: passed (no similar past diagnoses found for this campaign).
+Issues: None
+Recommendations: None
 
 Campaign ID: Content 2
-Status: critical
-Diagnosis: Offer expiration date is in the past relative to today (Offer expires 1/5/26; current date 2026-01-07). This violates expiration freshness guidelines and would prevent proper validation and live deployment without an updated date. Headline and CTA comply; Winter look and asset set are consistent.
-Issues: Offer expiration is in the past (1/5/26).; Expiration date not at least 15 days ahead of the QA date.
-Recommendations: Update the offer expiration to a future date (e.g., 2026-02-15 or later).; Re-run QA after updating the expiration date to confirm compliance.
+Status: passed
+Diagnosis: Content 2 complies with New Creative guidelines. It includes a Headline (2025 Ford Explorer), a CTA (View Inventory), and a compliant Offer (0% APR for 60 months). The disclaimer is present with an expiration date. Asset Style Direction and Facebook assets are provided. Asset coverage aligns with the asset summary. Self-validation: passed (no similar past diagnoses found for this campaign).
+Issues: None
+Recommendations: None
 
 Campaign ID: Content 3
-Status: critical
-Diagnosis: Offer expiration date is in the past relative to today (Offer expires 1/5/26; current date 2026-01-07). This violates expiration freshness guidelines and would prevent proper validation and live deployment without an updated date. Headline and CTA comply; Winter look and asset set are consistent.
-Issues: Offer expiration is in the past (1/5/26).; Expiration date not at least 15 days ahead of the QA date.
-Recommendations: Update the offer expiration to a future date (e.g., 2026-02-15 or later).; Re-run QA after updating the expiration date to ensure compliance.
+Status: passed
+Diagnosis: Content 3 complies with New Creative guidelines. It includes a Headline (2025 Ford Super Duty), a CTA (View Inventory), and a compliant Offer (0% APR for 60 months). The disclaimer is present with an expiration date. Asset Style Direction and Facebook assets are provided. Asset coverage aligns with the asset summary. Self-validation: passed (no similar past diagnoses found for this campaign).
+Issues: None
+Recommendations: None
 
 Campaign ID: Content 4
-Status: observed
-Diagnosis: Offer field is empty. While New Creative allows some fields to be empty, providing an offer strengthens the value proposition. No disclaimer is present either; these are optional but recommended for better clarity and performance.
-Issues: Offer field is empty.; No disclaimer present (optional but recommended).
-Recommendations: Provide a clear offer in the Offer field (e.g., specific financing or pricing detail).; Add a short disclaimer and expiration date if possible to improve clarity and compliance.
+Status: critical
+Diagnosis: Content 4 is missing essential elements required for a valid New Creative: no Headline and no Offer provided, and no Disclaimer present. While a CTA ('View Inventory') exists, the Headline and Offer are mandatory elements per QA guidelines, and a disclaimer is highly recommended. Asset Style Direction exists, but the lack of required text elements prevents this campaign from being usable in its current form. Self-validation: passed (no similar past diagnoses found, but current candidate requires rework before approval).
+Issues: Missing Headline; Missing Offer; Missing Disclaimer
+Recommendations: Add a Headline (<= 75 characters). Example: 'Year-End Savings on Ford Trucks and SUVs'.; Add an Offer (<= 100 characters). If no specific offer, provide a generic value prop (e.g., '0% APR for 60 months' where applicable).; Add a Disclaimer with an expiration date (preferred to be at least 15 days from the QA date).; Populate missing assets for the Headline/Offer to ensure consistency across channels and consider adding a Facebook/Instagram asset set similar to Content 1-3.

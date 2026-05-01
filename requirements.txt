@@ -1,6 +1,7 @@
 langgraph
 langchain
 langchain-core
+langsmith
 langchain-openai
 langchain-community
 langchain-qdrant

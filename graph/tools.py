@@ -231,12 +231,36 @@ def parse_campaign_sheet(
 
         campaigns: list[Campaign] = []
 
-        # In your template, the row with "Content 1"..."Content 10"/"Content 20"
-        # is at index 7 (0-based) even with the extra border / padding.
-        CAMPAIGN_HEADER_ROW = 7  # row with "Content 1"..."Content 10"/"Content 20"
+        # Detect the campaign header row dynamically by finding the first row
+        # containing "Content 1" (or close variant), rather than assuming fixed index.
+        CAMPAIGN_HEADER_ROW = None
+        for r in range(df.shape[0]):
+            row_values = df.iloc[r]
+            found_content_1 = any(
+                isinstance(cell, str) and re.match(r"^\s*Content\s*1\s*$", cell, flags=re.IGNORECASE)
+                for cell in row_values
+            )
+            if found_content_1:
+                CAMPAIGN_HEADER_ROW = r
+                break
 
-        # Columns E..N → indices 4..13 (we still guard with df.shape[1])
-        for col in range(4, df.shape[1]):
+        # Fallback to historical template position if dynamic detection fails.
+        if CAMPAIGN_HEADER_ROW is None:
+            CAMPAIGN_HEADER_ROW = 7
+
+        # Detect campaign columns dynamically from header row values like "Content 1", "Content 2", etc.
+        campaign_columns: List[int] = []
+        if CAMPAIGN_HEADER_ROW < df.shape[0]:
+            for col_idx in range(df.shape[1]):
+                header_cell = df.iloc[CAMPAIGN_HEADER_ROW, col_idx]
+                if isinstance(header_cell, str) and re.match(r"^\s*Content\s+\d+\s*$", header_cell, flags=re.IGNORECASE):
+                    campaign_columns.append(col_idx)
+
+        # Fallback to historical fixed range if dynamic detection finds nothing.
+        if not campaign_columns:
+            campaign_columns = list(range(4, df.shape[1]))
+
+        for col in campaign_columns:
             try:
                 # Check if we can access the header row
                 if CAMPAIGN_HEADER_ROW >= df.shape[0]:
@@ -404,6 +428,16 @@ def _parse_spreadsheet_internal(spreadsheet_path: str) -> dict:
     Returns:
         A dict with: task_type, asset_summary, dealership_name, content_11_20, campaigns.
     """
+    use_mcp_sampling = (os.getenv("EXCEL_MCP_ENABLED", "false").strip().lower() == "true")
+    if use_mcp_sampling:
+        print(f"[Spreadsheet Parser] Loading spreadsheet via MCP sampling: {spreadsheet_path}")
+        try:
+            from graph.mcp_excel_sampling import parse_spreadsheet_via_mcp_sampling
+
+            return parse_spreadsheet_via_mcp_sampling(spreadsheet_path)
+        except Exception as exc:
+            print(f"[Spreadsheet Parser] MCP sampling failed, falling back to pandas parser: {exc}")
+
     print(f"[Spreadsheet Parser] Loading spreadsheet from: {spreadsheet_path}")
     xls = pd.ExcelFile(spreadsheet_path)
 
@@ -479,6 +513,24 @@ def load_and_parse_spreadsheet(spreadsheet_path: str) -> CampaignBrief:
 
     # Use the internal function to do the actual parsing
     return _parse_spreadsheet_internal(spreadsheet_path)
+
+
+@tool
+def load_and_parse_spreadsheet_mcp(spreadsheet_path: str) -> CampaignBrief:
+    """
+    Load the campaign spreadsheet using MCP Excel tools and normalize it into a
+    structured brief.
+
+    This tool uses:
+    - excel_describe_sheets(fileAbsolutePath)
+    - excel_read_sheet(fileAbsolutePath, sheetName)
+
+    It is intended for the Brief Creator agent to explicitly parse spreadsheet
+    content through the MCP path.
+    """
+    from graph.mcp_excel_sampling import parse_spreadsheet_via_mcp_sampling
+
+    return parse_spreadsheet_via_mcp_sampling(spreadsheet_path)
 
 
 def _get_qdrant_client():
@@ -1830,7 +1882,7 @@ def get_available_tools(agent_name: Optional[str] = None) -> list:
     
     # Define tool sets for each agent
     agent_tool_map = {
-        "brief_creator": base_tools,
+        "brief_creator": [load_and_parse_spreadsheet_mcp, load_and_parse_spreadsheet],
         "theme_agent": rag_tools,  # Has RAG access for rules + similar campaign search
         "new_creative_agent": rag_tools,  # Has RAG access for rules + similar campaign search
         "campaign_update_agent": campaign_update_tools,  # Has RAG access + previous campaign ID identification

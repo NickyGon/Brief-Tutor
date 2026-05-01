@@ -6,8 +6,8 @@ import json
 import traceback
 from pathlib import Path
 from dotenv import load_dotenv
-from graph.workflow import create_campaign_workflow
 from graph.models import AgentState
+from graph.langsmith_workflow import run_campaign_brief_workflow_traced
 
 
 def main():
@@ -25,13 +25,10 @@ def main():
     print("Campaign Brief Workflow - Starting Execution")
     print("=" * 80)
     
-    # Create the workflow
-    print("\n[Setup] Creating workflow...")
-    workflow = create_campaign_workflow()
-    print("[Setup] Workflow created successfully!")
+    print("\n[Setup] Workflow will be created at run time (see LangSmith trace: campaign_brief_workflow).")
     
     # Get spreadsheet path
-    spreadsheet_path = "2025-12-putnamfordfd-A-25651611.xlsx"  # User will add the path here
+    spreadsheet_path = "2025-11-rogerbeasleyvolvovcna-A-25008537.xlsx"  # User will add the path here
     
     if not spreadsheet_path:
         print("\n⚠️  WARNING: spreadsheet_path is not set!")
@@ -65,8 +62,11 @@ def main():
         print("(Progress messages from workflow nodes will appear below)")
         print("-" * 80)
         
-        # Invoke the workflow (runs to completion)
-        final_state = workflow.invoke(initial_state.model_dump())
+        # Invoke the workflow (runs to completion); root trace + compact I/O in LangSmith
+        final_state = run_campaign_brief_workflow_traced(
+            initial_state.model_dump(),
+            spreadsheet_path,
+        )
         
         print("\n" + "=" * 80)
         print("[Execution] Workflow completed successfully!")
