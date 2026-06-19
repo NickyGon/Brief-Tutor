@@ -8,6 +8,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from graph.models import AgentState
 from graph.langsmith_workflow import run_campaign_brief_workflow_traced
+from graph.llm_provider import get_primary_provider, is_vertex_enabled
+from graph.console_log import log_progress, strip_analytics_from_payload
 
 
 def main():
@@ -17,9 +19,19 @@ def main():
     # Load environment variables
     load_dotenv()
     
-    # Validate required environment variables
-    if not os.getenv("OPENAI_API_KEY"):
-        raise ValueError("OPENAI_API_KEY environment variable is required")
+    # Validate required provider credentials
+    llm_provider = get_primary_provider()
+    if llm_provider == "openai":
+        if not os.getenv("OPENAI_API_KEY"):
+            raise ValueError("OPENAI_API_KEY environment variable is required when LLM_PROVIDER=openai")
+    elif llm_provider == "vertexai":
+        if not os.getenv("VERTEX_PROJECT_ID"):
+            raise ValueError("VERTEX_PROJECT_ID is required when LLM_PROVIDER=vertexai")
+    else:
+        raise ValueError(f"Unsupported LLM_PROVIDER: {llm_provider}")
+
+    if os.getenv("LLM_PROVIDER", "openai").strip().lower() == "vertexai" and not is_vertex_enabled():
+        print("[Setup] ENABLE_VERTEXAI=false -> Vertex AI is disabled, forcing provider=openai.")
     
     print("=" * 80)
     print("Campaign Brief Workflow - Starting Execution")
@@ -76,17 +88,20 @@ def main():
         # Handle both dict and Pydantic model responses
         final_results = final_state.get("final_results")
         if final_results:
-            print("\n📊 FINAL RESULTS:")
-            print("-" * 80)
-            
+            log_progress("\nFINAL RESULTS:")
+            log_progress("-" * 80)
+
             # Convert to dict if it's a Pydantic model
             if hasattr(final_results, "model_dump"):
                 final_results = final_results.model_dump()
             elif hasattr(final_results, "dict"):
                 final_results = final_results.dict()
-            
-            # Pretty print the structured results
-            print(json.dumps(final_results, indent=2, ensure_ascii=False))
+
+            # Console: user-facing payload only (metrics go to workflow_metrics.jsonl)
+            display_results = strip_analytics_from_payload(final_results)
+            print(json.dumps(display_results, indent=2, ensure_ascii=False))
+            metrics_file = os.getenv("WORKFLOW_METRICS_FILE", "workflow_metrics.jsonl")
+            log_progress(f"\nRun metrics logged to: {metrics_file}")
             
         else:
             print("\n⚠️  No final_results found in the workflow output.")

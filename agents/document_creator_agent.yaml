@@ -190,7 +190,7 @@ tools:
         optional: [collection_name, file_type, top_k]
     - name: write_document_to_file
       description: >
-        Write a text document to a local file in the project root directory.
+        Write a text document to a local file in the project `results` directory.
         Use this tool to save the Brief Resume and Full Diagnoses Listing documents.
         Call this tool twice: once for the brief resume and once for the full listing.
       input_schema:

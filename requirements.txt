@@ -3,6 +3,9 @@ langchain
 langchain-core
 langsmith
 langchain-openai
+langchain-google-vertexai
+langchain-google-genai
+google-cloud-aiplatform
 langchain-community
 langchain-qdrant
 qdrant-client
@@ -14,6 +17,7 @@ pyyaml
 pypdf
 python-docx
 google-api-python-client
-google-auth
+google-auth>=2.15.0
 google-auth-httplib2
-google-auth-oauthlib
+google-auth-oauthlib>=1.2.4
+google-genai

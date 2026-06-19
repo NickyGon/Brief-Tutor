@@ -49,6 +49,7 @@ prompt: |
        - "passed": Use when the campaign has NO issues and complies with all rules. If issues array is empty, status MUST be "passed".
        - "observed": Use when the campaign has minor issues or recommendations but no critical problems that prevent it from being used.
        - "critical": Use when the campaign has serious issues that must be fixed before it can be used.
+    11b. For each diagnosis, you MUST include `grounding_evidence` with at least one concrete source reference or evidence quote.
     12. You MUST return your final response as a valid JSON object with the following exact structure:
        {
          "campaign_diagnoses": [
@@ -57,7 +58,8 @@ prompt: |
              "status": "critical",
              "diagnosis": "Detailed diagnosis text...",
              "issues": ["Issue 1", "Issue 2"],
-             "recommendations": ["Recommendation 1", "Recommendation 2"]
+             "recommendations": ["Recommendation 1", "Recommendation 2"],
+             "grounding_evidence": ["Source: <doc or brief reference>", "Evidence: <short supporting quote>"]
            },
            ...
          ]
@@ -199,4 +201,9 @@ outputs:
               description: "List of recommendations (if any)"
               items:
                 type: string
-          required: [campaign_id, status, diagnosis]
+            grounding_evidence:
+              type: array
+              description: "Evidence snippets or source references that ground the diagnosis."
+              items:
+                type: string
+          required: [campaign_id, status, diagnosis, grounding_evidence]

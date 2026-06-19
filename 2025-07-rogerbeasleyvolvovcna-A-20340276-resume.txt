@@ -1,8 +1,0 @@
-📊 Campaign Brief Diagnosis Summary
-Task Type: New Creative
----------------
-🔴 0 / 1
-🟡 0 / 1
-🟢 1 / 1
--------------------
-Campaign Content 1 passed evaluation because the Campaign Update references the previous brief via CU: A-20340276 and matches the previous campaign by headline. The update changes the asset style direction to point to the previous campaign and updates the vehicle photography instruction (Location - Please change this image to a new XC90 model. Thanks!), which is a valid style/text update under Campaign Update rules. There are no unmatched campaigns, and the change aligns with the RAG guidelines for Campaign Update.

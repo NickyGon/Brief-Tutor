@@ -145,7 +145,6 @@ secrets/
 *.xlsx
 *.xls
 *.csv
-!requirements.txt
 
 # Temporary files
 *.tmp
@@ -183,6 +182,9 @@ qdrant_storage/
 logs/
 
 # Documentation files (optional - uncomment if you don't want to track .docx files)
-# *.docx
-# *.pdf
+*.docx
+*.pdf
 
+# Results directory
+results/
+sheets/

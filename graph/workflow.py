@@ -8,13 +8,16 @@ import yaml
 import json
 import re
 import sys
+import os
+import time
 import traceback
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
-from langchain_openai import ChatOpenAI
 from langchain.agents import create_agent
 from graph.models import AgentState, CampaignBrief, CampaignDiagnosis, Campaign, Assets, OfferDetails, StyleDescriptions
 from graph.tools import get_available_tools
+from graph.llm_provider import create_chat_model, get_primary_provider, get_fallback_provider
+from graph.console_log import log_progress, log_analytics, log_verbose, show_console_analytics
 
 # Import from rag_ingestion (may need path adjustment)
 try:
@@ -71,10 +74,13 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
     # Document creator agent also needs more tokens to generate two full documents
     max_tokens = TASK_AGENT_MAX_TOKENS if node_name in ["theme_agent", "new_creative_agent", "campaign_update_agent", "document_creator_agent"] else DEFAULT_MAX_TOKENS
     
-    llm = ChatOpenAI(
-        model=DEFAULT_MODEL,
+    primary_provider = get_primary_provider()
+    fallback_provider = get_fallback_provider()
+    llm = create_chat_model(
+        provider=primary_provider,
+        model=os.getenv("LLM_MODEL", DEFAULT_MODEL),
         temperature=DEFAULT_TEMPERATURE,
-        max_tokens=max_tokens
+        max_tokens=max_tokens,
     )
     
     # Get the system prompt from config
@@ -142,12 +148,24 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
                 messages.insert(insert_idx, campaign_brief_message)
                 
         
-        # Convert dict messages to LangChain message objects
+        # Convert dict messages to LangChain message objects.
+        # Vertex/Gemini requires non-empty "parts" in message turns, so we skip
+        # empty text entries and guarantee at least one user turn exists.
         langchain_messages = []
         for msg in messages:
             if isinstance(msg, dict):
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
+                if content is None:
+                    content = ""
+                if not isinstance(content, str):
+                    content = str(content)
+                content = content.strip()
+
+                # Skip empty dict-based messages to avoid invalid Vertex payloads.
+                if not content:
+                    continue
+
                 if role == "system":
                     langchain_messages.append(SystemMessage(content=content))
                 elif role == "assistant":
@@ -155,14 +173,80 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
                 else:
                     langchain_messages.append(HumanMessage(content=content))
             else:
+                # Keep non-dict messages only when they carry non-empty content.
+                msg_content = getattr(msg, "content", None)
+                if msg_content is None:
+                    continue
+                if not isinstance(msg_content, str):
+                    msg_content = str(msg_content)
+                if not msg_content.strip():
+                    continue
                 langchain_messages.append(msg)
+
+        # Ensure at least one user message exists for model input.
+        if not any(isinstance(m, HumanMessage) for m in langchain_messages):
+            langchain_messages.append(
+                HumanMessage(
+                    content="Proceed with the campaign analysis using the provided campaign brief and instructions."
+                )
+            )
         
         # Create agent with tools
         agent = create_agent(llm, tools)
-        
-        # Invoke agent
-        response = agent.invoke({"messages": langchain_messages})
-        print(f"[{node_name}] Agent response: {response}")
+
+        # Invoke agent with provider fallback and per-node metrics
+        response = None
+        fallback_used = False
+        invoke_error = None
+        start_time = time.perf_counter()
+        try:
+            response = agent.invoke({"messages": langchain_messages})
+        except Exception as exc:
+            invoke_error = exc
+            if fallback_provider and fallback_provider != primary_provider:
+                print(
+                    f"[{node_name}] Primary provider '{primary_provider}' failed; retrying with fallback '{fallback_provider}'. Error: {exc}"
+                )
+                fallback_llm = create_chat_model(
+                    provider=fallback_provider,
+                    model=os.getenv("FALLBACK_LLM_MODEL", DEFAULT_MODEL),
+                    temperature=DEFAULT_TEMPERATURE,
+                    max_tokens=max_tokens,
+                )
+                fallback_agent = create_agent(fallback_llm, tools)
+                response = fallback_agent.invoke({"messages": langchain_messages})
+                fallback_used = True
+            else:
+                raise
+
+        # Some providers can return a response with finish_reason=MALFORMED_FUNCTION_CALL
+        # without raising an exception. In that case, retry once with a strict repair hint.
+        def _has_malformed_function_call(resp: Dict[str, Any]) -> bool:
+            if not resp or not resp.get("messages"):
+                return False
+            for m in resp.get("messages", []):
+                if not isinstance(m, AIMessage):
+                    continue
+                metadata = getattr(m, "response_metadata", {}) or {}
+                if str(metadata.get("finish_reason", "")).upper() == "MALFORMED_FUNCTION_CALL":
+                    return True
+            return False
+
+        if _has_malformed_function_call(response):
+            print(f"[{node_name}] Detected MALFORMED_FUNCTION_CALL. Retrying once with tool-call repair instructions.")
+            repair_messages = list(langchain_messages)
+            repair_messages.append(
+                HumanMessage(
+                    content=(
+                        "Your previous tool call was malformed. Retry now.\n"
+                        "Use valid JSON arguments matching the tool schema exactly.\n"
+                        "Call one tool at a time, then continue."
+                    )
+                )
+            )
+            response = agent.invoke({"messages": repair_messages})
+        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        log_verbose(f"[{node_name}] Agent response: {response}")
         
         # Convert response back to dict format and extract tool results
         updated_messages = messages.copy()
@@ -239,12 +323,12 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
                     # Extract tool results - look for CampaignBrief from load_and_parse_spreadsheet
                     tool_result = msg.content
                     
-                    # Check if this is from load_and_parse_spreadsheet tool
+                    # Check if this is from the spreadsheet loader tools only.
+                    # Do not infer from generic payload content (e.g. any JSON containing task_type),
+                    # otherwise non-loader tools can accidentally overwrite state.campaign_brief.
                     tool_name = getattr(msg, 'name', None) or getattr(msg, 'tool_call_id', None)
                     is_spreadsheet_tool = (
-                        "load_and_parse_spreadsheet" in str(tool_name).lower() or
-                        "spreadsheet" in str(tool_result).lower() or
-                        (isinstance(tool_result, (dict, str)) and "task_type" in str(tool_result))
+                        "load_and_parse_spreadsheet" in str(tool_name).lower()
                     )
                     
                     # Try to parse tool_result as JSON if it's a string
@@ -254,54 +338,56 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
                         except (json.JSONDecodeError, TypeError):
                             # If it's not JSON, check if it contains campaign brief data
                             if is_spreadsheet_tool:
-                                print(f"[DEBUG] Tool result is string but not JSON: {tool_result[:200]}")
+                                log_verbose(f"[DEBUG] Tool result is string but not JSON: {tool_result[:200]}")
                             pass
                     
-                    # Check if this is already a CampaignBrief object
-                    if isinstance(tool_result, CampaignBrief):
-                        updated_campaign_brief = tool_result
-                        print(f"[DEBUG] Tool result is already a CampaignBrief with {len(tool_result.campaigns)} campaigns")
-                    # Check if this is a CampaignBrief result (has task_type and campaigns)
-                    elif isinstance(tool_result, dict) and "task_type" in tool_result and "campaigns" in tool_result:
-                        try:
-                            print(f"[DEBUG] Found CampaignBrief in tool result. Task type: {tool_result.get('task_type')}, Campaigns: {len(tool_result.get('campaigns', []))}")
-                            
-                            # Convert campaigns from dicts back to Campaign objects if needed
-                            campaigns_data = tool_result.get("campaigns", [])
-                            # Reconstruct Campaign objects if they're dicts
-                            reconstructed_campaigns = []
-                            for camp_data in campaigns_data:
-                                if isinstance(camp_data, dict):
-                                    try:
-                                        reconstructed_campaigns.append(Campaign(**camp_data))
-                                    except Exception as e:
-                                        print(f"[ERROR] Failed to reconstruct Campaign from dict: {type(e).__name__}: {str(e)}")
-                                        print(f"       Campaign data keys: {list(camp_data.keys()) if isinstance(camp_data, dict) else 'N/A'}")
-                                        # Try to reconstruct nested objects
+                    # Only spreadsheet loader results should update the main campaign_brief state.
+                    if is_spreadsheet_tool:
+                        # Check if this is already a CampaignBrief object
+                        if isinstance(tool_result, CampaignBrief):
+                            updated_campaign_brief = tool_result
+                            log_verbose(f"[DEBUG] Tool result is already a CampaignBrief with {len(tool_result.campaigns)} campaigns")
+                        # Check if this is a CampaignBrief result (has task_type and campaigns)
+                        elif isinstance(tool_result, dict) and "task_type" in tool_result and "campaigns" in tool_result:
+                            try:
+                                log_verbose(f"[DEBUG] Found CampaignBrief in tool result. Task type: {tool_result.get('task_type')}, Campaigns: {len(tool_result.get('campaigns', []))}")
+                                
+                                # Convert campaigns from dicts back to Campaign objects if needed
+                                campaigns_data = tool_result.get("campaigns", [])
+                                # Reconstruct Campaign objects if they're dicts
+                                reconstructed_campaigns = []
+                                for camp_data in campaigns_data:
+                                    if isinstance(camp_data, dict):
                                         try:
-                                            # Handle nested Pydantic models
-                                            if "assets" in camp_data and isinstance(camp_data["assets"], dict):
-                                                camp_data["assets"] = Assets(**camp_data["assets"])
-                                            if "offer_details" in camp_data and isinstance(camp_data["offer_details"], dict):
-                                                camp_data["offer_details"] = OfferDetails(**camp_data["offer_details"])
-                                            if "style_descriptions" in camp_data and isinstance(camp_data["style_descriptions"], dict):
-                                                camp_data["style_descriptions"] = StyleDescriptions(**camp_data["style_descriptions"])
                                             reconstructed_campaigns.append(Campaign(**camp_data))
-                                        except Exception as e2:
-                                            print(f"[ERROR] Failed to reconstruct Campaign even with nested objects: {type(e2).__name__}: {str(e2)}")
-                                elif isinstance(camp_data, Campaign):
-                                    reconstructed_campaigns.append(camp_data)
-                                else:
-                                    print(f"[WARN] Unexpected campaign data type: {type(camp_data)}")
-                            
-                            tool_result["campaigns"] = reconstructed_campaigns
-                            updated_campaign_brief = CampaignBrief(**tool_result)
-                            print(f"[DEBUG] Successfully created CampaignBrief with {len(updated_campaign_brief.campaigns)} campaigns")
-                        except Exception as e:
-                            # If parsing fails, log the error for debugging
-                            print(f"[ERROR] Failed to create CampaignBrief from tool result: {type(e).__name__}: {str(e)}")
-                            print(f"       Tool result keys: {list(tool_result.keys()) if isinstance(tool_result, dict) else 'N/A'}")
-                            traceback.print_exc()
+                                        except Exception as e:
+                                            print(f"[ERROR] Failed to reconstruct Campaign from dict: {type(e).__name__}: {str(e)}")
+                                            print(f"       Campaign data keys: {list(camp_data.keys()) if isinstance(camp_data, dict) else 'N/A'}")
+                                            # Try to reconstruct nested objects
+                                            try:
+                                                # Handle nested Pydantic models
+                                                if "assets" in camp_data and isinstance(camp_data["assets"], dict):
+                                                    camp_data["assets"] = Assets(**camp_data["assets"])
+                                                if "offer_details" in camp_data and isinstance(camp_data["offer_details"], dict):
+                                                    camp_data["offer_details"] = OfferDetails(**camp_data["offer_details"])
+                                                if "style_descriptions" in camp_data and isinstance(camp_data["style_descriptions"], dict):
+                                                    camp_data["style_descriptions"] = StyleDescriptions(**camp_data["style_descriptions"])
+                                                reconstructed_campaigns.append(Campaign(**camp_data))
+                                            except Exception as e2:
+                                                print(f"[ERROR] Failed to reconstruct Campaign even with nested objects: {type(e2).__name__}: {str(e2)}")
+                                    elif isinstance(camp_data, Campaign):
+                                        reconstructed_campaigns.append(camp_data)
+                                    else:
+                                        print(f"[WARN] Unexpected campaign data type: {type(camp_data)}")
+                                
+                                tool_result["campaigns"] = reconstructed_campaigns
+                                updated_campaign_brief = CampaignBrief(**tool_result)
+                                log_verbose(f"[DEBUG] Successfully created CampaignBrief with {len(updated_campaign_brief.campaigns)} campaigns")
+                            except Exception as e:
+                                # If parsing fails, log the error for debugging
+                                print(f"[ERROR] Failed to create CampaignBrief from tool result: {type(e).__name__}: {str(e)}")
+                                print(f"       Tool result keys: {list(tool_result.keys()) if isinstance(tool_result, dict) else 'N/A'}")
+                                traceback.print_exc()
                     
                     # Ensure tool_result is JSON serializable
                     def make_json_serializable(obj):
@@ -328,10 +414,29 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
                     
                     updated_messages.append({
                         "role": "tool",
+                        "name": str(tool_name) if tool_name else "",
+                        "tool_call_id": str(getattr(msg, "tool_call_id", "") or ""),
                         "content": tool_content
                     })
         
-        result = {"messages": updated_messages, "next_node": node_name}
+        state_metadata = state.metadata.copy() if isinstance(state.metadata, dict) else {}
+        node_metrics = state_metadata.get("node_metrics", [])
+        if not isinstance(node_metrics, list):
+            node_metrics = []
+        node_metrics.append(
+            {
+                "node": node_name,
+                "provider": fallback_provider if fallback_used else primary_provider,
+                "primary_provider": primary_provider,
+                "fallback_provider": fallback_provider,
+                "fallback_used": fallback_used,
+                "latency_ms": elapsed_ms,
+                "error": str(invoke_error)[:300] if invoke_error else None,
+            }
+        )
+        state_metadata["node_metrics"] = node_metrics
+
+        result = {"messages": updated_messages, "next_node": node_name, "metadata": state_metadata}
 
         if updated_campaign_brief:
             result["campaign_brief"] = updated_campaign_brief
@@ -348,12 +453,7 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
             agent_display_name = agent_display_names.get(node_name, node_name.upper())
             
             if updated_diagnoses and len(updated_diagnoses) > 0:
-                print("\n" + "="*80)
-                print(f"🔍 {agent_display_name} - DIAGNOSES RESULTS")
-                print("="*80)
-                print(f"\n📊 Total Diagnoses: {len(updated_diagnoses)}")
-                
-                # Count statuses
+                log_progress(f"[{agent_display_name}] Produced {len(updated_diagnoses)} diagnosis(es).")
                 status_counts = {"critical": 0, "observed": 0, "passed": 0}
                 for diag in updated_diagnoses:
                     if isinstance(diag, CampaignDiagnosis):
@@ -364,53 +464,56 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
                         continue
                     if status in status_counts:
                         status_counts[status] += 1
-                
-                print(f"\n📈 Status Breakdown:")
-                print(f"   🔴 Critical: {status_counts['critical']}")
-                print(f"   🟡 Observed: {status_counts['observed']}")
-                print(f"   🟢 Passed: {status_counts['passed']}")
-                
-                print(f"\n📝 Detailed Diagnoses:")
-                print("-" * 80)
-                for i, diag in enumerate(updated_diagnoses, 1):
-                    if isinstance(diag, CampaignDiagnosis):
-                        campaign_id = diag.campaign_id
-                        status = diag.status
-                        diagnosis = diag.diagnosis
-                        issues = diag.issues
-                        recommendations = diag.recommendations
-                    elif isinstance(diag, dict):
-                        campaign_id = diag.get("campaign_id", "Unknown")
-                        status = diag.get("status", "unknown")
-                        diagnosis = diag.get("diagnosis", "")
-                        issues = diag.get("issues", [])
-                        recommendations = diag.get("recommendations", [])
-                    else:
-                        continue
-                    
-                    status_emoji = {"critical": "🔴", "observed": "🟡", "passed": "🟢"}.get(status, "⚪")
-                    print(f"\n{i}. {status_emoji} Campaign: {campaign_id} [{status.upper()}]")
-                    print(f"   Diagnosis: {diagnosis[:200] + '...' if len(diagnosis) > 200 else diagnosis}")
-                    
-                    if issues:
-                        print(f"   Issues ({len(issues)}):")
-                        for issue in issues[:3]:  # Show first 3 issues
-                            print(f"     - {issue[:100] + '...' if len(issue) > 100 else issue}")
-                        if len(issues) > 3:
-                            print(f"     ... and {len(issues) - 3} more issues")
-                    
-                    if recommendations:
-                        print(f"   Recommendations ({len(recommendations)}):")
-                        for rec in recommendations[:3]:  # Show first 3 recommendations
-                            print(f"     - {rec[:100] + '...' if len(rec) > 100 else rec}")
-                        if len(recommendations) > 3:
-                            print(f"     ... and {len(recommendations) - 3} more recommendations")
-                
-                print("\n" + "="*80)
-                print("➡️  Proceeding to QA Agent for review...")
-                print("="*80 + "\n")
+                if show_console_analytics():
+                    log_analytics("\n" + "=" * 80)
+                    log_analytics(f"🔍 {agent_display_name} - DIAGNOSES RESULTS")
+                    log_analytics("=" * 80)
+                    log_analytics(f"\n📊 Total Diagnoses: {len(updated_diagnoses)}")
+                    log_analytics(f"\n📈 Status Breakdown:")
+                    log_analytics(f"   🔴 Critical: {status_counts['critical']}")
+                    log_analytics(f"   🟡 Observed: {status_counts['observed']}")
+                    log_analytics(f"   🟢 Passed: {status_counts['passed']}")
+                    log_analytics(f"\n📝 Detailed Diagnoses:")
+                    log_analytics("-" * 80)
+                    for i, diag in enumerate(updated_diagnoses, 1):
+                        if isinstance(diag, CampaignDiagnosis):
+                            campaign_id = diag.campaign_id
+                            status = diag.status
+                            diagnosis = diag.diagnosis
+                            issues = diag.issues
+                            recommendations = diag.recommendations
+                        elif isinstance(diag, dict):
+                            campaign_id = diag.get("campaign_id", "Unknown")
+                            status = diag.get("status", "unknown")
+                            diagnosis = diag.get("diagnosis", "")
+                            issues = diag.get("issues", [])
+                            recommendations = diag.get("recommendations", [])
+                        else:
+                            continue
+                        status_emoji = {"critical": "🔴", "observed": "🟡", "passed": "🟢"}.get(status, "⚪")
+                        log_analytics(
+                            f"\n{i}. {status_emoji} Campaign: {campaign_id} [{status.upper()}]"
+                        )
+                        log_analytics(
+                            f"   Diagnosis: {diagnosis[:200] + '...' if len(diagnosis) > 200 else diagnosis}"
+                        )
+                        if issues:
+                            log_analytics(f"   Issues ({len(issues)}):")
+                            for issue in issues[:3]:
+                                log_analytics(f"     - {issue[:100] + '...' if len(issue) > 100 else issue}")
+                            if len(issues) > 3:
+                                log_analytics(f"     ... and {len(issues) - 3} more issues")
+                        if recommendations:
+                            log_analytics(f"   Recommendations ({len(recommendations)}):")
+                            for rec in recommendations[:3]:
+                                log_analytics(f"     - {rec[:100] + '...' if len(rec) > 100 else rec}")
+                            if len(recommendations) > 3:
+                                log_analytics(
+                                    f"     ... and {len(recommendations) - 3} more recommendations"
+                                )
+                    log_analytics("\n" + "=" * 80 + "\n")
             else:
-                print(f"\n[WARN] {agent_display_name} did not produce any diagnoses.")
+                log_progress(f"\n[WARN] {agent_display_name} did not produce any diagnoses.")
         
         # Preserve existing state fields
         if state.rework_count is not None:
@@ -555,8 +658,13 @@ def diagnosis_formatter_node(state: AgentState) -> Dict[str, Any]:
             "campaign_diagnoses": []
         }
     
+    min_groundedness = float(os.getenv("EVAL_MIN_GROUNDEDNESS", "0.8"))
+    min_field_completeness = float(os.getenv("EVAL_MIN_FIELD_COMPLETENESS", "1.0"))
+
     # 1. Structure validation
     validation_errors = []
+    grounded_count = 0
+    complete_fields_count = 0
     for i, diag in enumerate(diagnoses):
         if isinstance(diag, dict):
             campaign_id = diag.get("campaign_id", "")
@@ -564,12 +672,14 @@ def diagnosis_formatter_node(state: AgentState) -> Dict[str, Any]:
             diagnosis = diag.get("diagnosis", "")
             issues = diag.get("issues", [])
             recommendations = diag.get("recommendations", [])
+            grounding_evidence = diag.get("grounding_evidence", [])
         elif isinstance(diag, CampaignDiagnosis):
             campaign_id = diag.campaign_id
             status = diag.status
             diagnosis = diag.diagnosis
             issues = diag.issues or []
             recommendations = diag.recommendations or []
+            grounding_evidence = diag.grounding_evidence or []
         else:
             validation_errors.append(f"Diagnosis {i+1}: Invalid format")
             continue
@@ -589,10 +699,40 @@ def diagnosis_formatter_node(state: AgentState) -> Dict[str, Any]:
             validation_errors.append(f"Diagnosis {i+1}: Issues must be a list")
         if not isinstance(recommendations, list):
             validation_errors.append(f"Diagnosis {i+1}: Recommendations must be a list")
+        if not isinstance(grounding_evidence, list):
+            validation_errors.append(f"Diagnosis {i+1}: grounding_evidence must be a list")
+
+        has_required_fields = bool(campaign_id and status and diagnosis and isinstance(issues, list) and isinstance(recommendations, list))
+        if has_required_fields:
+            complete_fields_count += 1
+        if isinstance(grounding_evidence, list) and any(str(item).strip() for item in grounding_evidence):
+            grounded_count += 1
     
-    # 2. Lightweight RAG validation (quick check)
-    # This is a basic check - full validation was done by task agents during self-validation
+    total_diagnoses = len(diagnoses)
+    groundedness_score = (grounded_count / total_diagnoses) if total_diagnoses else 0.0
+    field_completeness_score = (complete_fields_count / total_diagnoses) if total_diagnoses else 0.0
+
+    if groundedness_score < min_groundedness:
+        validation_errors.append(
+            f"Groundedness score {groundedness_score:.2f} is below threshold {min_groundedness:.2f}. "
+            "Each diagnosis should include grounding_evidence entries."
+        )
+    if field_completeness_score < min_field_completeness:
+        validation_errors.append(
+            f"Field completeness score {field_completeness_score:.2f} is below threshold {min_field_completeness:.2f}."
+        )
+
+    # 2. Lightweight eval gate
     validation_passed = len(validation_errors) == 0
+    eval_metrics = {
+        "grounded_count": grounded_count,
+        "total_diagnoses": total_diagnoses,
+        "groundedness_score": round(groundedness_score, 4),
+        "field_completeness_score": round(field_completeness_score, 4),
+        "min_groundedness": min_groundedness,
+        "min_field_completeness": min_field_completeness,
+        "passed": validation_passed,
+    }
     
     if not validation_passed:
         print(f"[Diagnosis Formatter] ⚠️  Validation failed with {len(validation_errors)} errors:")
@@ -608,7 +748,8 @@ def diagnosis_formatter_node(state: AgentState) -> Dict[str, Any]:
                 "next": "final_results",
                 "next_node": "diagnosis_formatter",
                 "campaign_diagnoses": diagnoses,
-                "rework_count": updated_rework_count
+                "rework_count": updated_rework_count,
+                "metadata": {**(state.metadata or {}), "eval_metrics": eval_metrics}
             }
         
         # Determine which agent to route back to
@@ -637,7 +778,8 @@ def diagnosis_formatter_node(state: AgentState) -> Dict[str, Any]:
             "next_node": "diagnosis_formatter",
             "campaign_diagnoses": diagnoses,
             "rework_count": updated_rework_count,
-            "messages": updated_messages
+            "messages": updated_messages,
+            "metadata": {**(state.metadata or {}), "eval_metrics": eval_metrics}
         }
     
     # 3. Save diagnoses locally as JSON file
@@ -679,7 +821,8 @@ def diagnosis_formatter_node(state: AgentState) -> Dict[str, Any]:
                     "status": diag.status,
                     "diagnosis": diag.diagnosis,
                     "issues": diag.issues or [],
-                    "recommendations": diag.recommendations or []
+                    "recommendations": diag.recommendations or [],
+                    "grounding_evidence": diag.grounding_evidence or [],
                 })
             elif isinstance(diag, dict):
                 diagnoses_list.append(diag)
@@ -692,7 +835,8 @@ def diagnosis_formatter_node(state: AgentState) -> Dict[str, Any]:
             "spreadsheet_path": spreadsheet_path,
             "diagnosis_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "total_campaigns": len(diagnoses_list),
-            "campaign_diagnoses": diagnoses_list
+            "campaign_diagnoses": diagnoses_list,
+            "eval_metrics": eval_metrics,
         }
         
         # Save to local file
@@ -705,11 +849,10 @@ def diagnosis_formatter_node(state: AgentState) -> Dict[str, Any]:
         print(f"[Diagnosis Formatter] ✓ Diagnoses saved locally: {output_path}")
         print(f"     File: {output_filename}")
         
-        # Display the JSON content
-        print(f"\n[Diagnosis Formatter] 📄 Diagnoses JSON Content:")
-        print("-" * 80)
-        print(json.dumps(output_data, indent=2, ensure_ascii=False))
-        print("-" * 80)
+        log_analytics(f"\n[Diagnosis Formatter] 📄 Diagnoses JSON Content:")
+        log_analytics("-" * 80)
+        log_analytics(json.dumps(output_data, indent=2, ensure_ascii=False))
+        log_analytics("-" * 80)
             
     except Exception as e:
         # Log error but don't fail the workflow if storage fails
@@ -728,7 +871,8 @@ def diagnosis_formatter_node(state: AgentState) -> Dict[str, Any]:
         "next": "document_creator_agent",
         "next_node": "diagnosis_formatter",
         "diagnoses_json_path": str(output_path) if output_path else None,  # Pass path to JSON file
-        "rework_count": state.rework_count or 0
+        "rework_count": state.rework_count or 0,
+        "metadata": {**(state.metadata or {}), "eval_metrics": eval_metrics}
     }
 
 
@@ -806,7 +950,10 @@ def document_creator_node(state: AgentState) -> Dict[str, Any]:
     passed_count = sum(1 for d in diagnoses_data if d.get("status") == "passed")
     total_count = len(diagnoses_data)
     
-    print(f"[Document Creator] 📊 Campaign counts: Critical={critical_count}, Observed={observed_count}, Passed={passed_count}, Total={total_count}")
+    log_analytics(
+        f"[Document Creator] 📊 Campaign counts: Critical={critical_count}, "
+        f"Observed={observed_count}, Passed={passed_count}, Total={total_count}"
+    )
     
     # Extract filename base from the JSON file path (which was created by diagnosis formatter)
     filename_base = ""
@@ -897,25 +1044,24 @@ DO NOT copy example text. Generate everything from the actual diagnosis data pro
     result = document_creator_agent(agent_state)
     print(f"[Document Creator] ✓ Agent response received")
     
-    # Debug: Print full response structure
-    print(f"[Document Creator] 🔍 Debugging agent response...")
+    log_verbose("[Document Creator] 🔍 Debugging agent response...")
     if result.get("messages"):
-        print(f"     Total messages in response: {len(result['messages'])}")
+        log_verbose(f"     Total messages in response: {len(result['messages'])}")
         for i, msg in enumerate(result["messages"]):
             msg_type = type(msg).__name__ if not isinstance(msg, dict) else msg.get("role", "unknown")
-            print(f"     Message {i}: {msg_type}")
+            log_verbose(f"     Message {i}: {msg_type}")
             if isinstance(msg, dict):
-                print(f"       Keys: {list(msg.keys())}")
+                log_verbose(f"       Keys: {list(msg.keys())}")
                 if "tool_calls" in msg:
-                    print(f"       Tool calls: {msg['tool_calls']}")
+                    log_verbose(f"       Tool calls: {msg['tool_calls']}")
                 if "content" in msg:
                     content_preview = str(msg["content"])[:200] if msg["content"] else "None"
-                    print(f"       Content preview: {content_preview}...")
+                    log_verbose(f"       Content preview: {content_preview}...")
             elif hasattr(msg, 'tool_calls'):
-                print(f"       Tool calls attribute: {msg.tool_calls}")
+                log_verbose(f"       Tool calls attribute: {msg.tool_calls}")
             elif hasattr(msg, 'content'):
                 content_preview = str(msg.content)[:200] if msg.content else "None"
-                print(f"       Content preview: {content_preview}...")
+                log_verbose(f"       Content preview: {content_preview}...")
     
     # Check for tool calls in the agent response
     # The agent should have called write_document_to_file twice (once for brief_resume, once for full_listing)
@@ -938,7 +1084,7 @@ DO NOT copy example text. Generate everything from the actual diagnosis data pro
             
             # Check for tool calls
             if tool_calls:
-                print(f"[Document Creator] 🔍 Found {len(tool_calls)} tool call(s)")
+                log_verbose(f"[Document Creator] 🔍 Found {len(tool_calls)} tool call(s)")
                 for tool_call in tool_calls:
                     # Handle both dict and LangChain tool call formats
                     if isinstance(tool_call, dict):
@@ -948,7 +1094,7 @@ DO NOT copy example text. Generate everything from the actual diagnosis data pro
                         tool_name = getattr(tool_call, 'name', '')
                         args = getattr(tool_call, 'args', {}) or {}
                     
-                    print(f"     Tool call: {tool_name} with args: {args}")
+                    log_verbose(f"     Tool call: {tool_name} with args: {args}")
                     if tool_name == "write_document_to_file":
                         tool_calls_found.append(tool_call)
                         doc_type = args.get("document_type", "") if isinstance(args, dict) else getattr(args, 'document_type', '')
@@ -971,22 +1117,31 @@ DO NOT copy example text. Generate everything from the actual diagnosis data pro
                     tool_name = getattr(msg, 'name', '')
                     content = getattr(msg, 'content', '')
                 
-                if "write_document_to_file" in str(tool_name).lower():
-                    try:
-                        if isinstance(content, str):
-                            tool_result = json.loads(content)
-                        else:
-                            tool_result = content
-                        if isinstance(tool_result, dict) and tool_result.get("success"):
-                            doc_type = tool_result.get("document_type", "")
-                            file_name = tool_result.get("file_name", "")
-                            if doc_type == "brief_resume":
-                                brief_resume_written = True
-                                print(f"[Document Creator] ✓ Tool result: Brief Resume written successfully -> {file_name}")
-                            elif doc_type == "full_listing":
-                                full_listing_written = True
-                                print(f"[Document Creator] ✓ Tool result: Full Listing written successfully -> {file_name}")
-                    except Exception as e:
+                # Some wrappers may omit tool name in serialized messages; in that case,
+                # detect document writes from the tool result payload itself.
+                is_write_doc_tool = "write_document_to_file" in str(tool_name).lower()
+                try:
+                    if isinstance(content, str):
+                        tool_result = json.loads(content)
+                    else:
+                        tool_result = content
+
+                    if isinstance(tool_result, dict) and tool_result.get("success"):
+                        doc_type = str(tool_result.get("document_type", "")).strip().lower()
+                        file_name = tool_result.get("file_name", "")
+                        if doc_type == "brief_resume":
+                            brief_resume_written = True
+                            print(f"[Document Creator] ✓ Tool result: Brief Resume written successfully -> {file_name}")
+                        elif doc_type == "full_listing":
+                            full_listing_written = True
+                            print(f"[Document Creator] ✓ Tool result: Full Listing written successfully -> {file_name}")
+                        elif is_write_doc_tool:
+                            # Tool name matches but doc_type was unexpected.
+                            print(f"[Document Creator] ⚠️  Unexpected document_type in tool result: {tool_result.get('document_type')}")
+                except Exception as e:
+                    # Only warn when this looked like the write tool, otherwise ignore
+                    # unrelated tool payloads that are not JSON.
+                    if is_write_doc_tool:
                         print(f"[Document Creator] ⚠️  Error parsing tool result: {e}")
                         print(f"     Tool result content: {str(content)[:200]}")
     
@@ -1049,7 +1204,8 @@ def final_results_node(state: AgentState) -> Dict[str, Any]:
                 "status": diag.status,
                 "diagnosis": diag.diagnosis,
                 "issues": diag.issues,
-                "recommendations": diag.recommendations
+                "recommendations": diag.recommendations,
+                "grounding_evidence": diag.grounding_evidence,
             })
         elif isinstance(diag, dict):
             diagnoses_list.append(diag)
@@ -1076,21 +1232,22 @@ def final_results_node(state: AgentState) -> Dict[str, Any]:
             "observed": status_counts["observed"],
             "passed": status_counts["passed"]
         },
+        "eval_metrics": (state.metadata or {}).get("eval_metrics", {}),
+        "node_metrics": (state.metadata or {}).get("node_metrics", []),
         "qa_result": state.qa_result,
         "rework_count": state.rework_count or 0
     }
     
-    # Create friendly message for the user
-    friendly_message = f"""Great! I've completed the analysis of your Campaign Brief.
-
-📊 Summary:
-• It's a {task_type} Campaign Brief
-• It has {total_campaigns} Campaign{'s' if total_campaigns != 1 else ''}
-• Status Breakdown: {status_counts['critical']} critical, {status_counts['observed']} observed, {status_counts['passed']} passed
-
-📋 Detailed Results (JSON format for frontend):
-{json.dumps(final_results, indent=2)}
-"""
+    # Friendly message for UI/consumers (metrics stay in final_results, not echoed here)
+    friendly_message = (
+        f"Completed analysis of your Campaign Brief.\n"
+        f"Task type: {task_type}\n"
+        f"Campaigns: {total_campaigns}\n"
+        f"Diagnoses: {len(diagnoses_list)} "
+        f"({status_counts['critical']} critical, {status_counts['observed']} observed, "
+        f"{status_counts['passed']} passed).\n"
+        f"See final_results for structured output."
+    )
     
     # Add final message to state
     updated_messages = state.messages.copy() if state.messages else []
@@ -1127,7 +1284,7 @@ def brief_creator_node(state: AgentState) -> Dict[str, Any]:
     # Invoke the agent
     result = brief_creator_agent(state)
 
-    print(f"[Brief Creator] Result: {result}")
+    log_verbose(f"[Brief Creator] Result: {result}")
     # Print findings to console if campaign_brief was extracted
     if "campaign_brief" in result and result["campaign_brief"]:
         campaign_brief = result["campaign_brief"]

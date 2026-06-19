@@ -74,6 +74,10 @@ class CampaignDiagnosis(BaseModel):
         default_factory=list,
         description="List of recommendations (if any)"
     )
+    grounding_evidence: List[str] = Field(
+        default_factory=list,
+        description="Short evidence snippets or source references used to ground this diagnosis."
+    )
 
 
 class AgentState(BaseModel):

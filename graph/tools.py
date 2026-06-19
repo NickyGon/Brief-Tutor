@@ -7,6 +7,7 @@ from graph.models import Campaign, CampaignBrief, OfferDetails, StyleDescription
 from collections import Counter
 import re
 import json
+import ast
 import pandas as pd
 import os
 import sys
@@ -15,6 +16,23 @@ import glob
 import traceback
 from pathlib import Path
 from dotenv import load_dotenv
+try:
+    from graph.llm_provider import create_embeddings, get_primary_provider
+except Exception:
+    # Keep spreadsheet/core tools usable even when optional provider deps are missing.
+    def get_primary_provider() -> str:  # type: ignore[no-redef]
+        return os.getenv("LLM_PROVIDER", "openai")
+
+    def create_embeddings(provider: str, model: str):  # type: ignore[no-redef]
+        from langchain_openai import OpenAIEmbeddings
+
+        if provider and provider.lower() != "openai":
+            raise RuntimeError(
+                "Requested non-openai embeddings provider but optional provider "
+                "dependencies are unavailable. Install provider extras or set "
+                "EMBEDDING_PROVIDER=openai."
+            )
+        return OpenAIEmbeddings(model=model)
 
 # Load environment variables
 load_dotenv()
@@ -23,7 +41,6 @@ load_dotenv()
 try:
     from qdrant_client import QdrantClient
     from qdrant_client.models import Distance, VectorParams, Filter, FieldCondition, MatchValue
-    from langchain_openai import OpenAIEmbeddings
     from langchain_qdrant import Qdrant
     QDRANT_AVAILABLE = True
 except ImportError:
@@ -90,7 +107,14 @@ OT_LABELS = [f"OT {i}" for i in range(1, 7)]  # "OT 1"..."OT 6"
 
 def _build_row_index_map(df: pd.DataFrame) -> tuple[dict, dict]:
     """Return (row_map, ot_row_map) based on labels in the detected label column."""
+    # Guard for empty/sparse dataframes (can happen with MCP sampling on malformed sheets)
+    if df is None or df.empty or df.shape[1] == 0:
+        return {}, {}
+
     label_col_idx = _find_label_column(df)
+    if label_col_idx < 0 or label_col_idx >= df.shape[1]:
+        return {}, {}
+
     label_col = df.iloc[:, label_col_idx]
 
     row_map: dict[str, int] = {}
@@ -177,6 +201,9 @@ def _find_label_column(df: pd.DataFrame) -> int:
     Find the column that contains row labels like 'SL | BN | SRP | DA', 'Facebook Assets', etc.
     Falls back to column 3 (D) if nothing is found.
     """
+    if df is None or df.empty or df.shape[1] == 0:
+        return -1
+
     candidate_labels = list(ROW_LABEL_TO_KEY.keys()) + OT_LABELS
 
     for c in range(df.shape[1]):
@@ -184,8 +211,8 @@ def _find_label_column(df: pd.DataFrame) -> int:
         if any(isinstance(v, str) and v.strip() in candidate_labels for v in col):
             return c
 
-    # Fallback to old assumption (column D)
-    return 3
+    # Fallback to old assumption (column D) only when it exists.
+    return 3 if df.shape[1] > 3 else 0
 
 
 def parse_campaign_sheet(
@@ -428,6 +455,16 @@ def _parse_spreadsheet_internal(spreadsheet_path: str) -> dict:
     Returns:
         A dict with: task_type, asset_summary, dealership_name, content_11_20, campaigns.
     """
+    use_custom_brief_mcp = (os.getenv("CUSTOM_BRIEF_MCP_ENABLED", "false").strip().lower() == "true")
+    if use_custom_brief_mcp:
+        print(f"[Spreadsheet Parser] Loading spreadsheet via custom MCP: {spreadsheet_path}")
+        try:
+            from graph.mcp_utils import parse_spreadsheet_via_custom_mcp
+
+            return parse_spreadsheet_via_custom_mcp(spreadsheet_path)
+        except Exception as exc:
+            print(f"[Spreadsheet Parser] Custom MCP failed, falling back to existing parsers: {exc}")
+
     use_mcp_sampling = (os.getenv("EXCEL_MCP_ENABLED", "false").strip().lower() == "true")
     if use_mcp_sampling:
         print(f"[Spreadsheet Parser] Loading spreadsheet via MCP sampling: {spreadsheet_path}")
@@ -533,6 +570,29 @@ def load_and_parse_spreadsheet_mcp(spreadsheet_path: str) -> CampaignBrief:
     return parse_spreadsheet_via_mcp_sampling(spreadsheet_path)
 
 
+@tool
+def load_and_parse_spreadsheet_custom_mcp(spreadsheet_path: str) -> CampaignBrief:
+    """
+    Load and parse the campaign spreadsheet through the in-repo custom MCP flow:
+    1) read workbook data
+    2) extract campaign brief values
+    3) curate CampaignBrief-shaped JSON
+    """
+    use_custom_brief_mcp = (
+        os.getenv("CUSTOM_BRIEF_MCP_ENABLED", "false").strip().lower() == "true"
+    )
+    if not use_custom_brief_mcp:
+        print(
+            "[Spreadsheet Parser] CUSTOM_BRIEF_MCP_ENABLED=false; "
+            "falling back to internal parser path."
+        )
+        return _parse_spreadsheet_internal(spreadsheet_path)
+
+    from graph.mcp_utils import parse_spreadsheet_via_custom_mcp
+
+    return parse_spreadsheet_via_custom_mcp(spreadsheet_path)
+
+
 def _get_qdrant_client():
     """
     Creates and returns a Qdrant client instance.
@@ -573,13 +633,10 @@ def _get_qdrant_vectorstore(collection_name: str = None):
     collection_name = collection_name or os.getenv("QDRANT_COLLECTION_NAME", "my_rag_collection")
     
     try:
-        # Use the same embedding model as ingestion (import from rag_ingestion)
-        if EMBEDDING_MODEL:
-            embedding_model = EMBEDDING_MODEL
-        else:
-            # Fallback if import fails (shouldn't happen in normal operation)
-            embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
-        embeddings = OpenAIEmbeddings(model=embedding_model)
+        # Use the same model/provider defaults as ingestion.
+        embedding_model = EMBEDDING_MODEL or os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
+        embedding_provider = os.getenv("EMBEDDING_PROVIDER", get_primary_provider())
+        embeddings = create_embeddings(provider=embedding_provider, model=embedding_model)
         vectorstore = Qdrant(
             client=client,
             collection_name=collection_name,
@@ -1634,10 +1691,49 @@ def match_campaigns_by_headline(
         - unmatched_previous: List of campaigns from previous brief that had no match
         - summary: Statistics about the matching process
     """
+    def _parse_brief_payload(payload: Any, field_name: str) -> Dict[str, Any]:
+        """Parse a brief payload that may arrive as dict or imperfect JSON-like string."""
+        if isinstance(payload, dict):
+            return payload
+        if not isinstance(payload, str):
+            raise ValueError(f"{field_name} must be a dict or string payload")
+
+        text = payload.strip()
+        if not text:
+            raise ValueError(f"{field_name} is empty")
+
+        # Primary parse path (proper JSON).
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+        # Retry for malformed Windows-path escapes in JSON strings.
+        if "\\" in text:
+            try:
+                escaped = text.replace("\\", "\\\\")
+                parsed = json.loads(escaped)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+
+        # Last-chance parse for Python-dict-like payload strings.
+        try:
+            parsed = ast.literal_eval(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+        raise ValueError(f"Could not parse {field_name} as a brief object")
+
     try:
         # Parse both briefs
-        current_brief = json.loads(current_campaign_brief_json) if isinstance(current_campaign_brief_json, str) else current_campaign_brief_json
-        previous_brief = json.loads(previous_campaign_brief_json) if isinstance(previous_campaign_brief_json, str) else previous_campaign_brief_json
+        current_brief = _parse_brief_payload(current_campaign_brief_json, "current_campaign_brief_json")
+        previous_brief = _parse_brief_payload(previous_campaign_brief_json, "previous_campaign_brief_json")
         
         current_campaigns = current_brief.get("campaigns", [])
         previous_campaigns = previous_brief.get("campaigns", [])
@@ -1790,7 +1886,7 @@ def write_document_to_file(
     document_type: str
 ) -> str:
     """
-    Write a text document to a local file in the project root directory.
+    Write a text document to the local `results` directory in the project.
     
     This tool is used by the Document Creator Agent to save the Brief Resume and Full Diagnoses Listing documents.
     
@@ -1806,13 +1902,14 @@ def write_document_to_file(
     """
     try:
         project_root = Path(__file__).parent.parent
-        file_path = project_root / file_name
+        results_dir = project_root / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
         
         # Ensure the file_name doesn't contain path separators (security)
         if "/" in file_name or "\\" in file_name:
             # Extract just the filename
             file_name = Path(file_name).name
-            file_path = project_root / file_name
+        file_path = results_dir / file_name
         
         # Write the content to the file
         with open(file_path, 'w', encoding='utf-8') as f:
@@ -1824,7 +1921,7 @@ def write_document_to_file(
             "file_name": file_name,
             "document_type": document_type,
             "content_length": len(content),
-            "message": f"Successfully wrote {document_type} document to {file_name}"
+            "message": f"Successfully wrote {document_type} document to results/{file_name}"
         }
         
         print(f"[Document Creator Tool] ✓ Wrote {document_type} document: {file_name} ({len(content)} characters)")
@@ -1882,7 +1979,7 @@ def get_available_tools(agent_name: Optional[str] = None) -> list:
     
     # Define tool sets for each agent
     agent_tool_map = {
-        "brief_creator": [load_and_parse_spreadsheet_mcp, load_and_parse_spreadsheet],
+        "brief_creator": [load_and_parse_spreadsheet],
         "theme_agent": rag_tools,  # Has RAG access for rules + similar campaign search
         "new_creative_agent": rag_tools,  # Has RAG access for rules + similar campaign search
         "campaign_update_agent": campaign_update_tools,  # Has RAG access + previous campaign ID identification

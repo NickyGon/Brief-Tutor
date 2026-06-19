@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -127,10 +130,176 @@ def _compact_trace_outputs(outputs: Any) -> Dict[str, Any]:
         "diagnoses_json_path": outputs.get("diagnoses_json_path"),
         "diagnosis_count": len(outputs["campaign_diagnoses"]) if outputs.get("campaign_diagnoses") else 0,
         "diagnoses_preview": _diagnosis_preview(outputs.get("campaign_diagnoses")),
+        "eval_metrics": ((outputs.get("metadata") or {}).get("eval_metrics") if isinstance(outputs.get("metadata"), dict) else {}),
+        "node_metrics": ((outputs.get("metadata") or {}).get("node_metrics") if isinstance(outputs.get("metadata"), dict) else []),
         "campaign_brief_summary": brief_summary,
         "has_final_results": final_results is not None,
         "final_results_summary": result_summary,
     }
+
+
+def _metrics_provider_env() -> Dict[str, Any]:
+    """Non-secret provider configuration for metrics reports and downstream tooling."""
+    return {
+        "LLM_PROVIDER": (os.getenv("LLM_PROVIDER") or "").strip() or None,
+        "FALLBACK_LLM_PROVIDER": (os.getenv("FALLBACK_LLM_PROVIDER") or "").strip() or None,
+        "EMBEDDING_PROVIDER": (os.getenv("EMBEDDING_PROVIDER") or "").strip() or None,
+        "VERTEX_PROJECT_ID": (os.getenv("VERTEX_PROJECT_ID") or "").strip() or None,
+        "VERTEX_LOCATION": (os.getenv("VERTEX_LOCATION") or "").strip() or None,
+        "VERTEX_MODEL": (os.getenv("VERTEX_MODEL") or "").strip() or None,
+        "VERTEX_EMBEDDING_MODEL": (os.getenv("VERTEX_EMBEDDING_MODEL") or "").strip() or None,
+        "OPENAI_CHAT_MODEL": (os.getenv("OPENAI_CHAT_MODEL") or "").strip() or None,
+        "LLM_MODEL": (os.getenv("LLM_MODEL") or "").strip() or None,
+        "FALLBACK_LLM_MODEL": (os.getenv("FALLBACK_LLM_MODEL") or "").strip() or None,
+    }
+
+
+def _rollup_node_metrics(node_metrics: Any) -> Dict[str, Any]:
+    """Summarize per-node LLM metrics (provider, latency, fallback) for report consumers."""
+    if not isinstance(node_metrics, list):
+        return {}
+
+    by_provider: Dict[str, Dict[str, Any]] = {}
+    fallback_invocations = 0
+
+    for m in node_metrics:
+        if not isinstance(m, dict):
+            continue
+        prov = str(m.get("provider") or "unknown")
+        if m.get("fallback_used"):
+            fallback_invocations += 1
+        bucket = by_provider.setdefault(
+            prov,
+            {"invocations": 0, "latency_ms_total": 0, "nodes": []},
+        )
+        bucket["invocations"] += 1
+        lat = m.get("latency_ms")
+        if isinstance(lat, (int, float)):
+            bucket["latency_ms_total"] += int(lat)
+        node_name = m.get("node")
+        if node_name is not None:
+            bucket["nodes"].append(node_name)
+
+    for pdata in by_provider.values():
+        inv = pdata.get("invocations") or 0
+        total = pdata.get("latency_ms_total") or 0
+        pdata["latency_ms_avg"] = round(total / inv, 2) if inv else 0.0
+
+    return {
+        "total_node_invocations": len([m for m in node_metrics if isinstance(m, dict)]),
+        "fallback_invocations": fallback_invocations,
+        "by_invoked_provider": by_provider,
+    }
+
+
+def _final_results_metrics_slice(final_state: Dict[str, Any]) -> Dict[str, Any]:
+    fr = final_state.get("final_results")
+    if not isinstance(fr, dict):
+        return {}
+    return {
+        k: fr.get(k)
+        for k in ("task_type", "total_campaigns", "status_breakdown", "rework_count")
+        if k in fr
+    }
+
+
+def _emit_regression_alerts(final_state: Dict[str, Any]) -> List[str]:
+    alerts: List[str] = []
+    metadata = final_state.get("metadata") if isinstance(final_state, dict) else {}
+    if not isinstance(metadata, dict):
+        return alerts
+
+    eval_metrics = metadata.get("eval_metrics") or {}
+    if isinstance(eval_metrics, dict):
+        groundedness = eval_metrics.get("groundedness_score")
+        min_groundedness = eval_metrics.get("min_groundedness")
+        if isinstance(groundedness, (int, float)) and isinstance(min_groundedness, (int, float)) and groundedness < min_groundedness:
+            alerts.append(f"groundedness below threshold ({groundedness:.3f} < {min_groundedness:.3f})")
+
+        completeness = eval_metrics.get("field_completeness_score")
+        min_completeness = eval_metrics.get("min_field_completeness")
+        if isinstance(completeness, (int, float)) and isinstance(min_completeness, (int, float)) and completeness < min_completeness:
+            alerts.append(f"field completeness below threshold ({completeness:.3f} < {min_completeness:.3f})")
+
+    node_metrics = metadata.get("node_metrics") or []
+    if isinstance(node_metrics, list):
+        for node_metric in node_metrics:
+            if not isinstance(node_metric, dict):
+                continue
+            latency_ms = node_metric.get("latency_ms")
+            node = node_metric.get("node", "unknown")
+            if isinstance(latency_ms, int) and latency_ms > int(os.getenv("ALERT_MAX_NODE_LATENCY_MS", "45000")):
+                alerts.append(f"high latency detected on {node} ({latency_ms}ms)")
+    return alerts
+
+
+def _append_workflow_metrics(spreadsheet_path: str, final_state: Dict[str, Any], workflow_latency_ms: int) -> None:
+    metrics_path = Path(os.getenv("WORKFLOW_METRICS_FILE", "workflow_metrics.jsonl"))
+    metadata = final_state.get("metadata") if isinstance(final_state, dict) else {}
+    record = {
+        "workflow": "campaign_brief",
+        "spreadsheet_path": spreadsheet_path,
+        "latency_ms": workflow_latency_ms,
+        "eval_metrics": (metadata or {}).get("eval_metrics", {}) if isinstance(metadata, dict) else {},
+        "node_metrics": (metadata or {}).get("node_metrics", []) if isinstance(metadata, dict) else [],
+        "alerts": _emit_regression_alerts(final_state),
+    }
+    try:
+        with metrics_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.warning("Could not append workflow metrics: %s", exc)
+
+
+def _write_workflow_metrics_report(
+    spreadsheet_path: str,
+    final_state: Dict[str, Any],
+    workflow_latency_ms: int,
+) -> None:
+    """
+    Write a single-run JSON report (eval + node/provider metrics) for dashboards or other pipelines.
+    Set WORKFLOW_METRICS_REPORT_FILE to a path (e.g. reports/last_run_metrics.json).
+    """
+    report_path_raw = (os.getenv("WORKFLOW_METRICS_REPORT_FILE") or "").strip()
+    if not report_path_raw:
+        return
+
+    report_path = Path(report_path_raw)
+    metadata = final_state.get("metadata") if isinstance(final_state, dict) else {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    eval_metrics = metadata.get("eval_metrics") or {}
+    if not isinstance(eval_metrics, dict):
+        eval_metrics = {}
+
+    node_metrics = metadata.get("node_metrics") or []
+    if not isinstance(node_metrics, list):
+        node_metrics = []
+
+    alerts = _emit_regression_alerts(final_state)
+    report = {
+        "report_version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "workflow": "campaign_brief",
+        "spreadsheet_path": spreadsheet_path,
+        "workflow_latency_ms": workflow_latency_ms,
+        "provider_config": _metrics_provider_env(),
+        "eval_metrics": eval_metrics,
+        "node_metrics": node_metrics,
+        "node_metrics_summary": _rollup_node_metrics(node_metrics),
+        "alerts": alerts,
+        "final_results_summary": _final_results_metrics_slice(final_state),
+        "qa_result": final_state.get("qa_result") if isinstance(final_state, dict) else None,
+    }
+
+    try:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with report_path.open("w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+    except Exception as exc:
+        logger.warning("Could not write workflow metrics report: %s", exc)
 
 
 def _maybe_append_dataset_example(
@@ -204,9 +373,15 @@ def run_campaign_brief_workflow_traced(initial_state_dict: dict, spreadsheet_pat
     source_run_id = str(root.id) if root is not None else None
 
     workflow = create_campaign_workflow()
+    start = time.perf_counter()
     final_state = workflow.invoke(
         initial_state_dict, config=_workflow_run_config(spreadsheet_path)
     )
+    workflow_latency_ms = int((time.perf_counter() - start) * 1000)
+    _append_workflow_metrics(spreadsheet_path, final_state, workflow_latency_ms)
+    _write_workflow_metrics_report(spreadsheet_path, final_state, workflow_latency_ms)
+    for alert in _emit_regression_alerts(final_state):
+        logger.warning("Regression alert: %s", alert)
 
     _maybe_append_dataset_example(
         initial_state_dict=initial_state_dict,

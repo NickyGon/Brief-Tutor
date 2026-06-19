@@ -1,9 +1,0 @@
-📊 Campaign Brief Diagnosis Summary
-Task Type: New Creative
----------------
-🔴 1 / 4
-🟡 0 / 4
-🟢 3 / 4
--------------------
-
-Campaign Content 1 passed evaluation because it has a clear Headline (2025 Ford F-150), a CTA (View Inventory), and a compliant Offer (0% APR for 60 months). The disclaimer is present and dated (expires 1/5/26). Asset Style Direction and Facebook assets are provided. Content 2 passed evaluation because it includes a Headline (2025 Ford Explorer), a CTA (View Inventory), and a compliant Offer (0% APR for 60 months). The disclaimer is present with an expiration date. Asset Style Direction and Facebook assets are provided. Content 3 passed evaluation because it includes a Headline (2025 Ford Super Duty), a CTA (View Inventory), and a compliant Offer (0% APR for 60 months). The disclaimer is present with an expiration date. Asset Style Direction and Facebook assets are provided. Content 4 requires attention because it is missing a Headline, an Offer, and a Disclaimer, though a CTA is present; the recommendations suggest adding the missing elements to bring Content 4 into compliance.

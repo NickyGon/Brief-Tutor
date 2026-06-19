@@ -35,7 +35,7 @@ from uuid import uuid5, NAMESPACE_URL
 
 import pandas as pd
 from openpyxl import load_workbook
-from openai import OpenAI
+from graph.llm_provider import create_embeddings, get_primary_provider
 
 # Conditional imports that may fail
 try:
@@ -67,6 +67,33 @@ QDRANT_RETRY_DELAY = int(os.getenv("QDRANT_RETRY_DELAY", "5"))  # Wait 5 seconds
 # Embedding Model Configuration (Single Source of Truth)
 # -----------------------------
 
+def infer_vector_size_from_model(model_name: str) -> int:
+    """
+    Infer vector dimension from known embedding model names.
+
+    Defaults to 1536 when unknown to preserve backward compatibility.
+    """
+    model = (model_name or "").strip().lower()
+
+    # OpenAI embedding families
+    if "text-embedding-3-large" in model:
+        return 3072
+    if "text-embedding-3-small" in model:
+        return 1536
+
+    # Vertex embedding families
+    if "text-embedding-005" in model:
+        return 768
+    if "text-multilingual-embedding-002" in model:
+        return 768
+    if "gemini-embedding-001" in model:
+        return 3072
+
+    # Legacy/fallback heuristic
+    if "large" in model:
+        return 3072
+    return 1536
+
 def get_embedding_model() -> str:
     """Get the embedding model name from environment variable. Defaults to text-embedding-3-large."""
     return os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
@@ -80,7 +107,7 @@ def get_vector_size() -> int:
     will enforce the correct size for the embedding model to prevent mismatches.
     """
     embedding_model = get_embedding_model()
-    default_size = 3072 if "large" in embedding_model.lower() else 1536
+    default_size = infer_vector_size_from_model(embedding_model)
     # Allow override via env var, but validation in ensure_qdrant_collection will enforce correctness
     return int(os.getenv("RAG_VECTOR_SIZE", str(default_size)))
 
@@ -1304,11 +1331,9 @@ def ensure_qdrant_collection(
     # This overrides any incorrect RAG_VECTOR_SIZE environment variable or VECTOR_SIZE constant
     embedding_model = EMBEDDING_MODEL
     
-    # Calculate expected size directly from embedding model (don't use get_vector_size() which respects RAG_VECTOR_SIZE)
-    if "large" in embedding_model.lower():
-        expected_size = 3072
-    else:
-        expected_size = 1536
+    # Calculate expected size directly from embedding model
+    # (don't use get_vector_size() which respects RAG_VECTOR_SIZE overrides).
+    expected_size = infer_vector_size_from_model(embedding_model)
     
     # Override vector_size if it was passed in or from VECTOR_SIZE constant
     if vector_size is None:
@@ -1521,16 +1546,11 @@ def embed_text(texts: List[str]) -> List[List[float]]:
     Both models support up to 8,192 tokens per input, which is well above the chunk size.
     """
     embedding_model = EMBEDDING_MODEL
+    embedding_provider = os.getenv("EMBEDDING_PROVIDER", get_primary_provider())
     
     try:
-        client = OpenAI()
-        
-        # Batch process texts (OpenAI API handles batching efficiently)
-        resp = client.embeddings.create(
-            model=embedding_model,
-            input=texts,
-        )
-        return [d.embedding for d in resp.data]
+        embeddings_client = create_embeddings(provider=embedding_provider, model=embedding_model)
+        return embeddings_client.embed_documents(texts)
     
     except (ImportError, NameError):
         print("[WARN] OpenAI library not available. Using fallback hash-based embeddings.")
