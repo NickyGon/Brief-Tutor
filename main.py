@@ -8,7 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from graph.models import AgentState
 from graph.langsmith_workflow import run_campaign_brief_workflow_traced
-from graph.llm_provider import get_primary_provider, is_vertex_enabled
+from graph.llm_provider import get_primary_provider
 from graph.console_log import log_progress, strip_analytics_from_payload
 
 
@@ -24,14 +24,8 @@ def main():
     if llm_provider == "openai":
         if not os.getenv("OPENAI_API_KEY"):
             raise ValueError("OPENAI_API_KEY environment variable is required when LLM_PROVIDER=openai")
-    elif llm_provider == "vertexai":
-        if not os.getenv("VERTEX_PROJECT_ID"):
-            raise ValueError("VERTEX_PROJECT_ID is required when LLM_PROVIDER=vertexai")
-    else:
+    elif llm_provider != "openai":
         raise ValueError(f"Unsupported LLM_PROVIDER: {llm_provider}")
-
-    if os.getenv("LLM_PROVIDER", "openai").strip().lower() == "vertexai" and not is_vertex_enabled():
-        print("[Setup] ENABLE_VERTEXAI=false -> Vertex AI is disabled, forcing provider=openai.")
     
     print("=" * 80)
     print("Campaign Brief Workflow - Starting Execution")
@@ -40,7 +34,7 @@ def main():
     print("\n[Setup] Workflow will be created at run time (see LangSmith trace: campaign_brief_workflow).")
     
     # Get spreadsheet path
-    spreadsheet_path = "2025-11-rogerbeasleyvolvovcna-A-25008537.xlsx"  # User will add the path here
+    spreadsheet_path = "Campaigns/Steve Schmitt Group/steveschmittinchighland/2026-07-steveschmittinchighland-D-101822.xlsx"  # User will add the path here
     
     if not spreadsheet_path:
         print("\n⚠️  WARNING: spreadsheet_path is not set!")

@@ -81,14 +81,6 @@ def infer_vector_size_from_model(model_name: str) -> int:
     if "text-embedding-3-small" in model:
         return 1536
 
-    # Vertex embedding families
-    if "text-embedding-005" in model:
-        return 768
-    if "text-multilingual-embedding-002" in model:
-        return 768
-    if "gemini-embedding-001" in model:
-        return 3072
-
     # Legacy/fallback heuristic
     if "large" in model:
         return 3072

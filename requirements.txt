@@ -3,9 +3,6 @@ langchain
 langchain-core
 langsmith
 langchain-openai
-langchain-google-vertexai
-langchain-google-genai
-google-cloud-aiplatform
 langchain-community
 langchain-qdrant
 qdrant-client
@@ -21,3 +18,4 @@ google-auth>=2.15.0
 google-auth-httplib2
 google-auth-oauthlib>=1.2.4
 google-genai
+supabase

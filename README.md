@@ -38,17 +38,10 @@ pip install -r requirements.txt
    OPENAI_CHAT_MODEL=gpt-5-nano
 
    # LLM provider routing
-   ENABLE_VERTEXAI=true
    LLM_PROVIDER=openai
    FALLBACK_LLM_PROVIDER=
    LLM_MODEL=
    FALLBACK_LLM_MODEL=
-
-   # Vertex AI (required when LLM_PROVIDER=vertexai)
-   VERTEX_PROJECT_ID=your-gcp-project-id
-   VERTEX_LOCATION=us-central1
-   VERTEX_MODEL=gemini-2.0-flash-001
-   VERTEX_EMBEDDING_MODEL=text-embedding-005
 
    # Optional override for embeddings provider (defaults to LLM_PROVIDER)
    EMBEDDING_PROVIDER=
@@ -68,11 +61,11 @@ pip install -r requirements.txt
 
 3. Configure Google credentials:
    - Google Drive access uses the service account file in `GOOGLE_SERVICE_ACCOUNT_FILE`.
-   - Vertex AI calls require Application Default Credentials (ADC). Set:
+   - If your environment needs ADC-based Google API auth, set:
    ```bash
    GOOGLE_APPLICATION_CREDENTIALS=credentials/your-service-account.json
    ```
-   - Ensure that service account has IAM needed for Vertex AI (for example, `roles/aiplatform.user` for predict access) and Drive access to the relevant folders.
+   - Ensure that service account has Drive access to the relevant folders.
 
 ## Usage
 
@@ -83,13 +76,115 @@ The workflow is structured to be extended. Key components:
 - **graph/tools.py**: Custom tools for the agent
 - **graph/workflow.py**: Main workflow logic with provider fallback and per-node metrics
 
-### Provider Routing (OpenAI + Vertex)
+### Provider Routing (OpenAI)
 
-- `LLM_PROVIDER` selects the primary chat provider (`openai` or `vertexai`).
-- `ENABLE_VERTEXAI` is a hard safety switch; when `false`, all `vertexai` selections are forced to OpenAI.
+- `LLM_PROVIDER` should be `openai`.
 - `FALLBACK_LLM_PROVIDER` is optional; if configured, the workflow retries node calls on fallback provider when the primary fails.
 - `LLM_MODEL` and `FALLBACK_LLM_MODEL` can override defaults per provider.
-- `EMBEDDING_PROVIDER` controls embeddings independently from chat provider (defaults to `LLM_PROVIDER` when unset).
+- `EMBEDDING_PROVIDER` controls embeddings independently from chat provider (defaults to `LLM_PROVIDER` when unset; keep `openai`).
+
+### Post-Brief Route Toggle
+
+After `brief_creator` parses the spreadsheet, the workflow now supports two mutually exclusive routes:
+
+- `BRIEF_POST_PARSE_ROUTE=1`: original analyzer flow (`router` -> task-type agent -> diagnosis formatter -> document creator).
+- `BRIEF_POST_PARSE_ROUTE=0`: family-similarity-only flow (same-family local spreadsheet matching -> family similarity agent narrative enrichment -> similarity JSON/TXT outputs), then workflow ends.
+
+Optional thresholds for the similarity route:
+- `FAMILY_SIM_STRONG_THRESHOLD` (default `0.80`)
+- `FAMILY_SIM_REVIEW_THRESHOLD` (default `0.50`)
+
+Similarity score strategy (dual path + absolute pairing):
+- Always `10%` dealership / OEM / group proximity
+- Reference path (same account/group + matching A-/D- IDs in Style Direction/related fields):
+  high weight on reference strength (cue words like "Copy from"/"Refer to" make it stronger, but are not required when both sides share the same ID)
+  light content blend
+- Content path (no copy/refer ID signal):
+  StyleDirection/assets + campaign wording/structure dominate the remaining weight
+- Output is campaign pairing (1:1), not just ranked similarity:
+  - `absolute_pairs`: reference lock and/or very strong style-assets agreement
+  - `likely_pairs`: strong enough to pair
+  - `review_pairs`: human confirmation
+  - `unpaired_targets`: no acceptable pair
+- File ranking uses strongest assigned pair score so campaign count does not dilute similarity
+
+Narrative enrichment uses three parallel specialists (reference, style/assets, wording) feeding a synthesizer agent.
+
+### Hierarchical Similarity Discovery
+
+The similarity-only branch uses hierarchical candidate discovery with filename parsing:
+
+- Supported filename pattern: `YYYY-MM-[accountID]-[A-|D-]<id>.xlsx`
+- Confirmed examples:
+  - `2025-11-rogerbeasleyvolvovcna-A-25008537.xlsx`
+  - `2026-06-tonydivinousedcarsntrucks-D-94095.xlsx`
+- Search order:
+  1. same accountID folder
+  2. if no qualifying match, widen to:
+     - sibling account folders in the same group folder (when grouped), or
+     - sibling account/group folders under `Campaigns` (when ungrouped)
+
+Optional discovery controls:
+- `FAMILY_SIM_WIDEN_IF_NO_QUALIFYING` (default `true`)
+- `FAMILY_SIM_QUALIFYING_THRESHOLD` (default `0.80`)
+- `FAMILY_SIM_USE_OEM_FILTER` (default `true`)
+- `FAMILY_SIM_OEM_FALLBACK_IF_EMPTY` (default `true`)
+
+The same filename parser is reused by campaign-update previous-brief resolution logic to keep `A-` and `D-` handling consistent.
+
+### Dealership Metadata (Group/Account/OEM)
+
+For wider-scope matching accuracy, this project supports Supabase-seeded dealership metadata:
+
+- `dealership_groups`
+- `dealership_accounts`
+- `dealership_account_oems`
+
+Behavior in widened searches:
+- hard OEM/OEM-family compatibility filter first
+- fallback to broader candidates when filter returns empty (configurable)
+
+Special handling:
+- multi-OEM accounts use `dealership_account_oems`
+- accounts handling broadly set `handles_all_oems=true` (equivalent to `All`)
+- non-family accounts use `oem_family='NA'`
+
+### Supabase Connection Scaffold
+
+This project includes a Supabase connection folder at `graph/supabase/`:
+
+- `config.py`: environment-backed settings and readiness checks.
+- `client.py`: lazy/cached Supabase client factory (`anon` and `service_role` modes).
+- `repository.py`: workflow repository helpers (`upsert_brief`, `upsert_campaigns`, run and similarity persistence).
+- `__init__.py`: simple import surface for workflow modules.
+
+Environment variables:
+- `SUPABASE_ENABLED` (`true`/`false`)
+- `SUPABASE_URL`
+- `SUPABASE_ANON_KEY`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `SUPABASE_SCHEMA` (default `public`)
+
+Usage example:
+
+```python
+from graph.supabase import get_supabase_client, is_supabase_configured
+
+if is_supabase_configured():
+    client = get_supabase_client()
+    # Example: read from a table
+    response = client.table("briefs").select("*").limit(5).execute()
+```
+
+Repository example:
+
+```python
+from graph.supabase import SupabaseWorkflowRepository
+
+repo = SupabaseWorkflowRepository(use_service_role=True)
+brief_row = repo.upsert_brief(campaign_brief)
+repo.upsert_campaigns(brief_fk=brief_row["id"], campaign_brief=campaign_brief)
+```
 
 ## RAG Information Retrieval
 
@@ -120,7 +215,7 @@ This project uses **Qdrant Cloud** (not a local instance). To set up:
 
 The collection vector size is enforced based on the embedding model in use:
 - 3072 dimensions for OpenAI large embeddings
-- 1536 dimensions for small/Vertex-style embedding dimensions
+- 1536 dimensions for OpenAI small embeddings
 
 If a collection has mismatched dimensions, ingestion recreates it with the expected size.
 
@@ -160,17 +255,12 @@ processed = sync_from_gdrive_folder(
 
 **Environment Variables:**
 - `GOOGLE_SERVICE_ACCOUNT_FILE`: Path to custom Google service account JSON file (e.g., `credentials/your-service-account.json`)
-- `GOOGLE_APPLICATION_CREDENTIALS`: ADC path for Vertex AI auth (typically same service account JSON)
-- `LLM_PROVIDER`: Model provider for workflow agents (`openai` or `vertexai`)
-- `ENABLE_VERTEXAI`: Master safety switch for Vertex AI (`true`/`false`). If `false`, provider selection and fallback ignore `vertexai`.
+- `GOOGLE_APPLICATION_CREDENTIALS`: Optional ADC path for Google API auth (typically same service account JSON)
+- `LLM_PROVIDER`: Model provider for workflow agents (`openai`)
 - `FALLBACK_LLM_PROVIDER`: Optional fallback provider if primary provider fails
 - `LLM_MODEL`: Optional override for primary provider chat model
 - `FALLBACK_LLM_MODEL`: Optional override for fallback provider chat model
-- `VERTEX_PROJECT_ID`: GCP project for Vertex AI
-- `VERTEX_LOCATION`: Vertex region (default: `us-central1`)
-- `VERTEX_MODEL`: Vertex chat model (default: `gemini-2.0-flash-001`)
-- `VERTEX_EMBEDDING_MODEL`: Vertex embedding model (default: `text-embedding-005`)
-- `EMBEDDING_PROVIDER`: Optional override for embedding provider (`openai` or `vertexai`)
+- `EMBEDDING_PROVIDER`: Optional override for embedding provider (`openai`)
 - `QDRANT_URL`: Qdrant Cloud cluster URL (required, format: `https://your-cluster-id.qdrant.io`)
 - `QDRANT_API_KEY`: Qdrant Cloud API key (required for authentication)
 - `QDRANT_COLLECTION_NAME`: Qdrant collection name (default: `my_rag_collection`)

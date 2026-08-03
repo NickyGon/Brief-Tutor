@@ -14,10 +14,22 @@ import traceback
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain.agents import create_agent
+from graph.brief_naming import parse_brief_filename, resolve_spreadsheet_path
 from graph.models import AgentState, CampaignBrief, CampaignDiagnosis, Campaign, Assets, OfferDetails, StyleDescriptions
-from graph.tools import get_available_tools
+from graph.tools import (
+    get_available_tools,
+    extract_family_slug_from_filename,
+    extract_campaign_instance_id,
+    classify_campaign_path_hierarchy,
+    list_same_family_local_spreadsheets,
+    parse_local_spreadsheet_to_campaign_brief,
+    compare_briefs_and_rank,
+    resolve_global_campaign_pairs,
+    write_family_similarity_outputs,
+)
 from graph.llm_provider import create_chat_model, get_primary_provider, get_fallback_provider
 from graph.console_log import log_progress, log_analytics, log_verbose, show_console_analytics
+from graph.supabase import is_supabase_configured, SupabaseWorkflowRepository
 
 # Import from rag_ingestion (may need path adjustment)
 try:
@@ -36,6 +48,267 @@ DEFAULT_TEMPERATURE = 0.7  # Optimal for RAG and structured data processing
 
 # Higher token limits for agents that need to generate or evaluate multiple diagnoses
 TASK_AGENT_MAX_TOKENS = 12000  # For theme_agent, new_creative_agent, campaign_update_agent, qa_agent
+
+POST_PARSE_ROUTE_ENV = "BRIEF_POST_PARSE_ROUTE"
+
+
+def _copy_metadata(metadata: Any) -> Dict[str, Any]:
+    return metadata.copy() if isinstance(metadata, dict) else {}
+
+
+def _get_db_context(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    db_context = metadata.get("db", {})
+    if not isinstance(db_context, dict):
+        db_context = {}
+    warnings = db_context.get("warnings", [])
+    if not isinstance(warnings, list):
+        warnings = []
+    db_context["warnings"] = warnings
+    return db_context
+
+
+def _append_db_warning(db_context: Dict[str, Any], message: str) -> None:
+    warnings = db_context.get("warnings", [])
+    if not isinstance(warnings, list):
+        warnings = []
+    warnings.append(message)
+    db_context["warnings"] = warnings
+
+
+def _persist_brief_and_campaigns(
+    campaign_brief: CampaignBrief,
+    metadata: Dict[str, Any],
+    *,
+    create_run_if_missing: bool = True,
+) -> Dict[str, Any]:
+    db_context = _get_db_context(metadata)
+    db_context["enabled"] = bool(is_supabase_configured(use_service_role=True))
+    metadata["db"] = db_context
+    if not db_context["enabled"]:
+        return metadata
+
+    try:
+        repo = SupabaseWorkflowRepository(use_service_role=True)
+        brief_row = repo.upsert_brief(campaign_brief)
+        brief_fk = brief_row.get("id")
+        if isinstance(brief_fk, int):
+            db_context["brief_fk"] = brief_fk
+            repo.upsert_campaigns(brief_fk=brief_fk, campaign_brief=campaign_brief)
+            campaign_id_map = repo.get_campaign_id_map(brief_fk)
+            file_name = Path(campaign_brief.spreadsheet_path).name
+            campaign_maps = db_context.get("campaign_ids_by_file", {})
+            if not isinstance(campaign_maps, dict):
+                campaign_maps = {}
+            campaign_maps[file_name] = campaign_id_map
+            db_context["campaign_ids_by_file"] = campaign_maps
+            db_context["brief_id"] = brief_row.get("brief_id")
+
+            if create_run_if_missing and not db_context.get("run_fk"):
+                route_value = str(os.getenv(POST_PARSE_ROUTE_ENV, "1")).strip()
+                route_type = "similarity_only" if route_value == "0" else "standard_analyzer"
+                run_row = repo.create_analysis_run(
+                    route_type=route_type,
+                    brief_fk=brief_fk,
+                    config_snapshot={
+                        "brief_post_parse_route": route_value,
+                        "family_sim_strong_threshold": float(os.getenv("FAMILY_SIM_STRONG_THRESHOLD", "0.80")),
+                        "family_sim_review_threshold": float(os.getenv("FAMILY_SIM_REVIEW_THRESHOLD", "0.50")),
+                    },
+                )
+                run_fk = run_row.get("id")
+                if isinstance(run_fk, int):
+                    db_context["run_fk"] = run_fk
+                    db_context["run_uuid"] = run_row.get("run_uuid")
+                    db_context["route_type"] = route_type
+    except Exception as exc:
+        _append_db_warning(db_context, f"Brief/campaign persistence failed: {exc}")
+
+    metadata["db"] = db_context
+    return metadata
+
+
+def _normalize_diagnoses_list(diagnoses: List[Any]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for diagnosis in diagnoses:
+        if isinstance(diagnosis, CampaignDiagnosis):
+            normalized.append(
+                {
+                    "campaign_id": diagnosis.campaign_id,
+                    "status": diagnosis.status,
+                    "diagnosis": diagnosis.diagnosis,
+                    "issues": diagnosis.issues or [],
+                    "recommendations": diagnosis.recommendations or [],
+                    "grounding_evidence": diagnosis.grounding_evidence or [],
+                }
+            )
+        elif isinstance(diagnosis, dict):
+            normalized.append(diagnosis)
+    return normalized
+
+
+def _persist_diagnoses(
+    *,
+    campaign_brief: Optional[CampaignBrief],
+    diagnoses: List[Any],
+    eval_metrics: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    db_context = _get_db_context(metadata)
+    if not db_context.get("enabled"):
+        metadata["db"] = db_context
+        return metadata
+
+    run_fk = db_context.get("run_fk")
+    brief_fk = db_context.get("brief_fk")
+    if not isinstance(run_fk, int) or not isinstance(brief_fk, int):
+        metadata["db"] = db_context
+        return metadata
+
+    normalized = _normalize_diagnoses_list(diagnoses)
+    if not normalized:
+        metadata["db"] = db_context
+        return metadata
+
+    try:
+        repo = SupabaseWorkflowRepository(use_service_role=True)
+        file_name = Path(campaign_brief.spreadsheet_path).name if campaign_brief else ""
+        campaign_maps = db_context.get("campaign_ids_by_file", {})
+        campaign_id_map = campaign_maps.get(file_name, {}) if isinstance(campaign_maps, dict) else {}
+        if not campaign_id_map:
+            campaign_id_map = repo.get_campaign_id_map(brief_fk)
+            if isinstance(campaign_maps, dict) and file_name:
+                campaign_maps[file_name] = campaign_id_map
+                db_context["campaign_ids_by_file"] = campaign_maps
+
+        diagnosis_rows = repo.build_diagnosis_rows(
+            run_fk=run_fk,
+            brief_fk=brief_fk,
+            diagnoses=normalized,
+            campaign_id_map=campaign_id_map,
+            eval_metrics=eval_metrics,
+        )
+        inserted = repo.upsert_diagnosis_rows(diagnosis_rows)
+        db_context["diagnoses_persisted"] = len(inserted)
+    except Exception as exc:
+        _append_db_warning(db_context, f"Diagnosis persistence failed: {exc}")
+
+    metadata["db"] = db_context
+    return metadata
+
+
+def _persist_similarity_matches(
+    campaign_brief: Optional[CampaignBrief],
+    family_similarity_payload: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    db_context = _get_db_context(metadata)
+    if not db_context.get("enabled"):
+        metadata["db"] = db_context
+        return metadata
+
+    run_fk = db_context.get("run_fk")
+    if not isinstance(run_fk, int):
+        metadata["db"] = db_context
+        return metadata
+
+    strong_matches = family_similarity_payload.get("strong_matches", [])
+    review_matches = family_similarity_payload.get("review_matches", [])
+    absolute_pairs = family_similarity_payload.get("absolute_pairs", [])
+    likely_pairs = family_similarity_payload.get("likely_pairs", [])
+    review_pairs = family_similarity_payload.get("review_pairs", [])
+    if not isinstance(strong_matches, list):
+        strong_matches = []
+    if not isinstance(review_matches, list):
+        review_matches = []
+    if not isinstance(absolute_pairs, list):
+        absolute_pairs = []
+    if not isinstance(likely_pairs, list):
+        likely_pairs = []
+    if not isinstance(review_pairs, list):
+        review_pairs = []
+    # Prefer explicit pairing lists when present.
+    persist_strong = absolute_pairs + likely_pairs if (absolute_pairs or likely_pairs) else strong_matches
+    persist_review = review_pairs if review_pairs else review_matches
+
+    try:
+        repo = SupabaseWorkflowRepository(use_service_role=True)
+        campaign_maps = db_context.get("campaign_ids_by_file", {})
+        if not isinstance(campaign_maps, dict):
+            campaign_maps = {}
+
+        target_file_name = family_similarity_payload.get("target_file_name") or (
+            Path(campaign_brief.spreadsheet_path).name if campaign_brief else ""
+        )
+        needed_files = {str(target_file_name)}
+        for match in strong_matches + review_matches:
+            if isinstance(match, dict):
+                needed_files.add(str(match.get("file_name", "")))
+
+        for file_name in [name for name in needed_files if name]:
+            if file_name in campaign_maps:
+                continue
+            brief_id = Path(file_name).stem
+            brief_row = repo.get_brief_by_brief_id(brief_id)
+            brief_fk = brief_row.get("id") if isinstance(brief_row, dict) else None
+            if isinstance(brief_fk, int):
+                campaign_maps[file_name] = repo.get_campaign_id_map(brief_fk)
+
+        db_context["campaign_ids_by_file"] = campaign_maps
+        lookup: Dict[tuple[str, str], int] = {}
+        for file_name, map_data in campaign_maps.items():
+            if not isinstance(map_data, dict):
+                continue
+            for campaign_ext, campaign_fk in map_data.items():
+                if isinstance(campaign_fk, int):
+                    lookup[(str(file_name), str(campaign_ext))] = campaign_fk
+
+        strong_threshold = float(os.getenv("FAMILY_SIM_STRONG_THRESHOLD", "0.80"))
+        review_threshold = float(os.getenv("FAMILY_SIM_REVIEW_THRESHOLD", "0.50"))
+        if strong_threshold <= 1.0:
+            strong_threshold *= 100.0
+        if review_threshold <= 1.0:
+            review_threshold *= 100.0
+
+        match_rows = repo.build_similarity_rows(
+            run_fk=run_fk,
+            target_file_name=str(target_file_name),
+            strong_matches=persist_strong,
+            review_matches=persist_review,
+            campaign_fk_lookup=lookup,
+            strong_threshold=strong_threshold,
+            review_threshold=review_threshold,
+        )
+        inserted = repo.upsert_similarity_rows(match_rows)
+        db_context["similarity_matches_persisted"] = len(inserted)
+    except Exception as exc:
+        _append_db_warning(db_context, f"Similarity persistence failed: {exc}")
+
+    metadata["db"] = db_context
+    return metadata
+
+
+def _finalize_run_if_needed(metadata: Dict[str, Any], status: str = "completed") -> Dict[str, Any]:
+    db_context = _get_db_context(metadata)
+    if not db_context.get("enabled"):
+        metadata["db"] = db_context
+        return metadata
+    if db_context.get("run_finalized"):
+        metadata["db"] = db_context
+        return metadata
+
+    run_fk = db_context.get("run_fk")
+    if not isinstance(run_fk, int):
+        metadata["db"] = db_context
+        return metadata
+
+    try:
+        repo = SupabaseWorkflowRepository(use_service_role=True)
+        repo.finish_analysis_run(run_fk, status=status)
+        db_context["run_finalized"] = True
+    except Exception as exc:
+        _append_db_warning(db_context, f"Run finalization failed: {exc}")
+    metadata["db"] = db_context
+    return metadata
 
 
 def load_agent_config(yaml_path: str) -> Dict[str, Any]:
@@ -72,7 +345,13 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
     # Create LLM with specified parameters
     # Task-specific agents need more tokens to generate/validate diagnoses for multiple campaigns
     # Document creator agent also needs more tokens to generate two full documents
-    max_tokens = TASK_AGENT_MAX_TOKENS if node_name in ["theme_agent", "new_creative_agent", "campaign_update_agent", "document_creator_agent"] else DEFAULT_MAX_TOKENS
+    max_tokens = TASK_AGENT_MAX_TOKENS if node_name in [
+        "theme_agent",
+        "new_creative_agent",
+        "campaign_update_agent",
+        "document_creator_agent",
+        "family_similarity_agent",
+    ] else DEFAULT_MAX_TOKENS
     
     primary_provider = get_primary_provider()
     fallback_provider = get_fallback_provider()
@@ -149,8 +428,7 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
                 
         
         # Convert dict messages to LangChain message objects.
-        # Vertex/Gemini requires non-empty "parts" in message turns, so we skip
-        # empty text entries and guarantee at least one user turn exists.
+        # Skip empty text entries and guarantee at least one user turn exists.
         langchain_messages = []
         for msg in messages:
             if isinstance(msg, dict):
@@ -162,7 +440,7 @@ def create_agent_from_config(config_path: str, tools: List) -> Any:
                     content = str(content)
                 content = content.strip()
 
-                # Skip empty dict-based messages to avoid invalid Vertex payloads.
+                # Skip empty dict-based messages to avoid invalid model payloads.
                 if not content:
                     continue
 
@@ -744,12 +1022,20 @@ def diagnosis_formatter_node(state: AgentState) -> Dict[str, Any]:
         
         if updated_rework_count >= 3:
             print(f"[Diagnosis Formatter] Max reworks ({updated_rework_count}) reached. Proceeding to final_results.")
+            state_metadata = _copy_metadata(state.metadata)
+            state_metadata["eval_metrics"] = eval_metrics
+            state_metadata = _persist_diagnoses(
+                campaign_brief=state.campaign_brief,
+                diagnoses=diagnoses,
+                eval_metrics=eval_metrics,
+                metadata=state_metadata,
+            )
             return {
                 "next": "final_results",
                 "next_node": "diagnosis_formatter",
                 "campaign_diagnoses": diagnoses,
                 "rework_count": updated_rework_count,
-                "metadata": {**(state.metadata or {}), "eval_metrics": eval_metrics}
+                "metadata": state_metadata,
             }
         
         # Determine which agent to route back to
@@ -867,12 +1153,20 @@ def diagnosis_formatter_node(state: AgentState) -> Dict[str, Any]:
         print(f"\n[Diagnosis Formatter] ✓ JSON file created. Proceeding to document_creator_agent to create text documents.")
     else:
         print(f"\n[Diagnosis Formatter] ⚠️  JSON file creation failed. Proceeding to document_creator_agent anyway (it will handle the error).")
+    state_metadata = _copy_metadata(state.metadata)
+    state_metadata["eval_metrics"] = eval_metrics
+    state_metadata = _persist_diagnoses(
+        campaign_brief=state.campaign_brief,
+        diagnoses=diagnoses,
+        eval_metrics=eval_metrics,
+        metadata=state_metadata,
+    )
     return {
         "next": "document_creator_agent",
         "next_node": "diagnosis_formatter",
         "diagnoses_json_path": str(output_path) if output_path else None,  # Pass path to JSON file
         "rework_count": state.rework_count or 0,
-        "metadata": {**(state.metadata or {}), "eval_metrics": eval_metrics}
+        "metadata": state_metadata,
     }
 
 
@@ -1188,8 +1482,46 @@ def final_results_node(state: AgentState) -> Dict[str, Any]:
         Updated state with final_results containing structured output
     """
     
+    state_metadata = _copy_metadata(state.metadata)
+    state_metadata = _finalize_run_if_needed(state_metadata, status="completed")
     campaign_brief = state.campaign_brief
+    family_similarity = state.family_similarity or {}
     diagnoses = state.campaign_diagnoses or []
+
+    # Similarity-only route output.
+    if family_similarity:
+        final_results = {
+            "mode": "family_similarity",
+            "task_type": campaign_brief.task_type if campaign_brief else family_similarity.get("task_type"),
+            "total_campaigns": len(campaign_brief.campaigns) if campaign_brief else 0,
+            "family_similarity": family_similarity,
+            "node_metrics": state_metadata.get("node_metrics", []),
+            "db": state_metadata.get("db", {}),
+            "route_toggle_value": str(os.getenv(POST_PARSE_ROUTE_ENV, "1")).strip(),
+        }
+        friendly_message = (
+            "Completed family similarity analysis.\n"
+            f"Target file: {family_similarity.get('target_file_name', 'N/A')}\n"
+            f"Absolute pairs: {len(family_similarity.get('absolute_pairs', family_similarity.get('strong_matches', [])))}\n"
+            f"Likely pairs: {len(family_similarity.get('likely_pairs', []))}\n"
+            f"Review pairs: {len(family_similarity.get('review_pairs', family_similarity.get('review_matches', [])))}\n"
+            f"Unpaired targets: {len(family_similarity.get('unpaired_targets', []))}.\n"
+            "See final_results for structured output."
+        )
+        updated_messages = state.messages.copy() if state.messages else []
+        updated_messages.append({"role": "assistant", "content": friendly_message})
+        print(
+            "[Final Results] Similarity route completed. "
+            f"Absolute={len(family_similarity.get('absolute_pairs', family_similarity.get('strong_matches', [])))}, "
+            f"Likely={len(family_similarity.get('likely_pairs', []))}, "
+            f"Review={len(family_similarity.get('review_pairs', family_similarity.get('review_matches', [])))}"
+        )
+        return {
+            "final_results": final_results,
+            "next_node": "final_results",
+            "messages": updated_messages,
+            "metadata": state_metadata,
+        }
     
     # Build the structured response
     task_type = campaign_brief.task_type if campaign_brief else "Unknown"
@@ -1232,8 +1564,9 @@ def final_results_node(state: AgentState) -> Dict[str, Any]:
             "observed": status_counts["observed"],
             "passed": status_counts["passed"]
         },
-        "eval_metrics": (state.metadata or {}).get("eval_metrics", {}),
-        "node_metrics": (state.metadata or {}).get("node_metrics", []),
+        "eval_metrics": state_metadata.get("eval_metrics", {}),
+        "node_metrics": state_metadata.get("node_metrics", []),
+        "db": state_metadata.get("db", {}),
         "qa_result": state.qa_result,
         "rework_count": state.rework_count or 0
     }
@@ -1261,8 +1594,85 @@ def final_results_node(state: AgentState) -> Dict[str, Any]:
     return {
         "final_results": final_results,
         "next_node": "final_results",
-        "messages": updated_messages
+        "messages": updated_messages,
+        "metadata": state_metadata,
     }
+
+
+def _print_campaign_brief_findings(
+    campaign_brief: CampaignBrief,
+    *,
+    title: str = "BRIEF CREATOR - FINDINGS",
+) -> None:
+    """Print brief findings in the same style used by brief_creator."""
+    print("\n" + "=" * 80)
+    print(f"📋 {title}")
+    print("=" * 80)
+    print(f"\n📁 Spreadsheet Path: {campaign_brief.spreadsheet_path}")
+    print(f"📌 Task Type: {campaign_brief.task_type}")
+    print(f"🏢 Dealership Name: {campaign_brief.dealership_name or 'N/A'}")
+    print(f"📊 Asset Summary: {campaign_brief.asset_summary or 'N/A'}")
+    print(f"📑 Content 11-20: {'Yes' if campaign_brief.content_11_20 else 'No'}")
+    print(f"\n📈 Total Campaigns: {len(campaign_brief.campaigns)}")
+
+    if campaign_brief.campaigns:
+        print("\n📝 Campaigns Found:")
+        print("-" * 80)
+        for i, campaign in enumerate(campaign_brief.campaigns, 1):
+            print(f"\n{i}. Campaign ID: {campaign.campaign_id}")
+
+            if campaign.offer_details:
+                offer = campaign.offer_details
+                print(f"   📌 Headline: {offer.headline[:75] if offer.headline else 'N/A'}")
+                print(f"   💰 Offer: {offer.offer[:100] if offer.offer else 'N/A'}")
+                print(
+                    f"   📄 Body: {offer.body[:100] + '...' if offer.body and len(offer.body) > 100 else (offer.body or 'N/A')}"
+                )
+                print(f"   🎯 CTA: {offer.cta[:30] if offer.cta else 'N/A'}")
+
+            if campaign.style_descriptions:
+                style = campaign.style_descriptions
+                print(
+                    f"   🎨 Style Direction: {style.asset_style_direction[:80] + '...' if style.asset_style_direction and len(style.asset_style_direction) > 80 else (style.asset_style_direction or 'N/A')}"
+                )
+                if style.additional_style_information:
+                    extra = style.additional_style_information
+                    print(
+                        f"   🧾 Additional Style: {extra[:80] + '...' if len(extra) > 80 else extra}"
+                    )
+                if style.vehicle_photography:
+                    print(f"   📷 Vehicle Photography: {style.vehicle_photography}")
+                if style.logos:
+                    print(f"   🏷️  Logos: {style.logos}")
+
+            if campaign.assets:
+                assets = campaign.assets
+                asset_codes = []
+                if assets.sl_bn_srp_da:
+                    asset_codes.append("SL/BN/SRP/DA")
+                if assets.sl_m_bn_m:
+                    asset_codes.append("SL_M/BN_M")
+                if assets.facebook_assets:
+                    asset_codes.append("Facebook")
+                if assets.instagram_assets:
+                    asset_codes.append("Instagram")
+                if assets.google_assets:
+                    asset_codes.append("Google")
+                if assets.ot_1:
+                    asset_codes.append("OT1")
+                if assets.ot_2:
+                    asset_codes.append("OT2")
+                if assets.ot_3:
+                    asset_codes.append("OT3")
+                if assets.ot_4:
+                    asset_codes.append("OT4")
+                if assets.ot_5:
+                    asset_codes.append("OT5")
+                if assets.ot_6:
+                    asset_codes.append("OT6")
+                print(f"   🖼️  Assets: {', '.join(asset_codes) if asset_codes else 'None'}")
+
+    print("\n" + "=" * 80 + "\n")
 
 
 def brief_creator_node(state: AgentState) -> Dict[str, Any]:
@@ -1288,67 +1698,736 @@ def brief_creator_node(state: AgentState) -> Dict[str, Any]:
     # Print findings to console if campaign_brief was extracted
     if "campaign_brief" in result and result["campaign_brief"]:
         campaign_brief = result["campaign_brief"]
-        print("\n" + "="*80)
-        print("📋 BRIEF CREATOR - FINDINGS")
-        print("="*80)
-        print(f"\n📁 Spreadsheet Path: {campaign_brief.spreadsheet_path}")
-        print(f"📌 Task Type: {campaign_brief.task_type}")
-        print(f"🏢 Dealership Name: {campaign_brief.dealership_name or 'N/A'}")
-        print(f"📊 Asset Summary: {campaign_brief.asset_summary or 'N/A'}")
-        print(f"📑 Content 11-20: {'Yes' if campaign_brief.content_11_20 else 'No'}")
-        print(f"\n📈 Total Campaigns: {len(campaign_brief.campaigns)}")
-        
-        if campaign_brief.campaigns:
-            print("\n📝 Campaigns Found:")
-            print("-" * 80)
-            for i, campaign in enumerate(campaign_brief.campaigns, 1):
-                print(f"\n{i}. Campaign ID: {campaign.campaign_id}")
-                
-                # Offer Details
-                if campaign.offer_details:
-                    offer = campaign.offer_details
-                    print(f"   📌 Headline: {offer.headline[:75] if offer.headline else 'N/A'}")
-                    print(f"   💰 Offer: {offer.offer[:100] if offer.offer else 'N/A'}")
-                    print(f"   📄 Body: {offer.body[:100] + '...' if offer.body and len(offer.body) > 100 else (offer.body or 'N/A')}")
-                    print(f"   🎯 CTA: {offer.cta[:30] if offer.cta else 'N/A'}")
-                
-                # Style Descriptions
-                if campaign.style_descriptions:
-                    style = campaign.style_descriptions
-                    print(f"   🎨 Style Direction: {style.asset_style_direction[:50] + '...' if style.asset_style_direction and len(style.asset_style_direction) > 50 else (style.asset_style_direction or 'N/A')}")
-                
-                # Assets
-                if campaign.assets:
-                    assets = campaign.assets
-                    asset_codes = []
-                    if assets.sl_bn_srp_da:
-                        asset_codes.append("SL/BN/SRP/DA")
-                    if assets.sl_m_bn_m:
-                        asset_codes.append("SL_M/BN_M")
-                    if assets.facebook_assets:
-                        asset_codes.append("Facebook")
-                    if assets.instagram_assets:
-                        asset_codes.append("Instagram")
-                    if assets.google_assets:
-                        asset_codes.append("Google")
-                    if assets.ot_1:
-                        asset_codes.append("OT1")
-                    if assets.ot_2:
-                        asset_codes.append("OT2")
-                    if assets.ot_3:
-                        asset_codes.append("OT3")
-                    if assets.ot_4:
-                        asset_codes.append("OT4")
-                    if assets.ot_5:
-                        asset_codes.append("OT5")
-                    if assets.ot_6:
-                        asset_codes.append("OT6")
-                    print(f"   🖼️  Assets: {', '.join(asset_codes) if asset_codes else 'None'}")
-        
-        print("\n" + "="*80 + "\n")
+        state_metadata = _copy_metadata(result.get("metadata") or state.metadata)
+        state_metadata = _persist_brief_and_campaigns(
+            campaign_brief=campaign_brief,
+            metadata=state_metadata,
+            create_run_if_missing=True,
+        )
+        result["metadata"] = state_metadata
+        _print_campaign_brief_findings(campaign_brief, title="BRIEF CREATOR - FINDINGS")
     else:
         print("[Brief Creator] No campaign brief found")
     return result
+
+
+def _process_similarity_candidates(
+    *,
+    target_brief: CampaignBrief,
+    candidate_paths: List[str],
+    strong_threshold: float,
+    review_threshold: float,
+    state_metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    candidate_files: List[Dict[str, Any]] = []
+    collected_pairs: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    updated_metadata = state_metadata
+
+    for idx, candidate_path in enumerate(candidate_paths, 1):
+        try:
+            print(
+                f"\n[Family Similarity] Parsing candidate {idx}/{len(candidate_paths)}: "
+                f"{Path(candidate_path).name}"
+            )
+            candidate_brief = parse_local_spreadsheet_to_campaign_brief(candidate_path)
+            _print_campaign_brief_findings(
+                candidate_brief,
+                title=(
+                    f"FAMILY SIMILARITY - CANDIDATE {idx}/{len(candidate_paths)} FINDINGS "
+                    f"({Path(candidate_path).name})"
+                ),
+            )
+            updated_metadata = _persist_brief_and_campaigns(
+                campaign_brief=candidate_brief,
+                metadata=updated_metadata,
+                create_run_if_missing=False,
+            )
+            comparison = compare_briefs_and_rank(
+                target_brief=target_brief,
+                candidate_brief=candidate_brief,
+                strong_threshold=strong_threshold,
+                review_threshold=review_threshold,
+            )
+            candidate_entry = {
+                "file_name": Path(candidate_path).name,
+                "file_path": candidate_path,
+                "dealership_name": candidate_brief.dealership_name,
+                "task_type": candidate_brief.task_type,
+                "file_similarity_score": comparison.get("file_similarity_score", 0.0),
+                "component_averages": comparison.get("component_averages", {}),
+                "absolute_pairs": comparison.get("absolute_pairs", [])[:5],
+                "likely_pairs": comparison.get("likely_pairs", [])[:5],
+                "strongest_matches": comparison.get("best_campaign_matches", [])[:5],
+            }
+            candidate_files.append(candidate_entry)
+            components = comparison.get("component_averages", {}) or {}
+            print(
+                f"[Family Similarity] Candidate score: "
+                f"{float(candidate_entry['file_similarity_score']) * 100:.2f}% "
+                f"(strongest scored) | campaigns={len(candidate_brief.campaigns)} | "
+                f"absolute={len(comparison.get('absolute_pairs', []) or [])} "
+                f"likely={len(comparison.get('likely_pairs', []) or [])} "
+                f"review={len(comparison.get('review_pairs', []) or [])}"
+            )
+            print(
+                "[Family Similarity] Breakdown: "
+                f"styleDirection={float(components.get('style_direction_similarity', components.get('asset_and_style_similarity', 0.0))) * 100:.1f}% "
+                f"(styleFields={float(components.get('style_fields_similarity', 0.0)) * 100:.1f}%, "
+                f"assets={float(components.get('asset_structure_similarity', 0.0)) * 100:.1f}%) | "
+                f"wording={float(components.get('campaign_wording_similarity', 0.0)) * 100:.1f}% | "
+                f"dealership={float(components.get('dealership_relationship', 0.0)) * 100:.1f}% | "
+                f"refStrength={float(components.get('reference_strength', components.get('reference_id_boost', 0.0))) * 100:.1f}%"
+            )
+            best_raw = comparison.get("best_raw_pair")
+            if isinstance(best_raw, dict):
+                print(
+                    "[Family Similarity] Best raw pair: "
+                    f"{best_raw.get('target_campaign_id')} <-> {best_raw.get('candidate_campaign_id')} | "
+                    f"{float(best_raw.get('similarity_score', 0.0)) * 100:.2f}% | "
+                    f"status={best_raw.get('pair_status', 'none')} | "
+                    f"basis={best_raw.get('pair_basis', best_raw.get('scoring_path', 'n/a'))}"
+                )
+
+            seen_keys = set()
+            for list_key in ("absolute_pairs", "likely_pairs", "review_pairs"):
+                for match in comparison.get(list_key, []) or []:
+                    if not isinstance(match, dict):
+                        continue
+                    enriched = {
+                        **match,
+                        "file_name": candidate_entry["file_name"],
+                        "file_path": candidate_entry["file_path"],
+                        "dealership_name": candidate_entry["dealership_name"],
+                        "task_type": candidate_entry["task_type"],
+                        "similarity_percent": round(
+                            float(match.get("similarity_score", 0.0)) * 100, 2
+                        ),
+                    }
+                    key = (
+                        f"{enriched.get('target_campaign_id')}|"
+                        f"{enriched.get('candidate_campaign_id')}|"
+                        f"{enriched.get('file_name')}|"
+                        f"{enriched.get('pair_status')}"
+                    )
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    collected_pairs.append(enriched)
+        except Exception as exc:
+            warning = f"Skipped candidate '{candidate_path}': {exc}"
+            warnings.append(warning)
+            print(f"[Family Similarity] {warning}")
+
+    candidate_files.sort(key=lambda item: float(item.get("file_similarity_score", 0.0)), reverse=True)
+    return {
+        "candidate_files": candidate_files,
+        "collected_pairs": collected_pairs,
+        "warnings": warnings,
+        "metadata": updated_metadata,
+    }
+
+
+def _filter_candidates_with_oem_metadata(
+    *,
+    target_path: str,
+    candidate_paths: List[str],
+    state_metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    db_context = _get_db_context(state_metadata)
+    if not db_context.get("enabled"):
+        return {"candidate_paths": candidate_paths, "warnings": []}
+
+    try:
+        target_meta = parse_brief_filename(target_path) or {}
+        target_account = str(target_meta.get("account_id", "")).strip().lower()
+        if not target_account:
+            return {"candidate_paths": candidate_paths, "warnings": ["OEM filter skipped: could not parse target accountID."]}
+
+        repo = SupabaseWorkflowRepository(use_service_role=True)
+        source_metadata = repo.get_dealership_account_metadata(target_account)
+        if not source_metadata:
+            return {"candidate_paths": candidate_paths, "warnings": [f"OEM filter skipped: no metadata for account '{target_account}'."]}
+
+        filtered: List[str] = []
+        for candidate in candidate_paths:
+            candidate_meta = parse_brief_filename(candidate) or {}
+            candidate_account = str(candidate_meta.get("account_id", "")).strip().lower()
+            if not candidate_account:
+                continue
+            candidate_account_meta = repo.get_dealership_account_metadata(candidate_account)
+            if repo.oem_compatible(source_metadata, candidate_account_meta):
+                filtered.append(candidate)
+
+        return {"candidate_paths": filtered, "warnings": []}
+    except Exception as exc:
+        return {"candidate_paths": candidate_paths, "warnings": [f"OEM filter failed: {exc}"]}
+
+
+def family_similarity_analysis_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Similarity-only branch node (route=0).
+    Parses same-family spreadsheets and computes weighted campaign similarity.
+    """
+    campaign_brief = state.campaign_brief
+    state_metadata = _copy_metadata(state.metadata)
+    if not campaign_brief:
+        payload = {
+            "error": "campaign_brief not found in state",
+            "target_file_name": "",
+            "absolute_pairs": [],
+            "likely_pairs": [],
+            "review_pairs": [],
+            "unpaired_targets": [],
+            "strong_matches": [],
+            "review_matches": [],
+            "candidate_files": [],
+            "warnings": ["Brief creator did not produce campaign_brief; similarity analysis skipped."],
+        }
+        return {
+            "family_similarity": payload,
+            "next": "family_similarity_report",
+            "next_node": "family_similarity_analysis",
+            "metadata": state_metadata,
+        }
+
+    project_root = Path(__file__).parent.parent
+    target_path = campaign_brief.spreadsheet_path or ""
+    resolved_target_path = str(
+        resolve_spreadsheet_path(
+            target_path,
+            project_root=project_root,
+            strict=False,
+        )
+    ) if target_path else ""
+    target_file_name = Path(resolved_target_path).name if resolved_target_path else ""
+    family_slug = extract_family_slug_from_filename(target_path) if target_path else None
+    dealership_id = family_slug or "unknown"
+    spreadsheet_instance_id = extract_campaign_instance_id(target_path) or "unknown"
+
+    strong_threshold = float(os.getenv("FAMILY_SIM_STRONG_THRESHOLD", "0.80"))
+    review_threshold = float(os.getenv("FAMILY_SIM_REVIEW_THRESHOLD", "0.50"))
+    qualifying_threshold = float(
+        os.getenv("FAMILY_SIM_QUALIFYING_THRESHOLD", str(strong_threshold))
+    )
+    widen_if_no_qualifying = (
+        str(os.getenv("FAMILY_SIM_WIDEN_IF_NO_QUALIFYING", "true")).strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    use_oem_filter = (
+        str(os.getenv("FAMILY_SIM_USE_OEM_FILTER", "true")).strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    oem_fallback_if_empty = (
+        str(os.getenv("FAMILY_SIM_OEM_FALLBACK_IF_EMPTY", "true")).strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+    hierarchy_context = classify_campaign_path_hierarchy(resolved_target_path or target_path)
+    has_group_folder = bool(hierarchy_context.get("has_group_folder"))
+
+    account_candidate_paths = (
+        list_same_family_local_spreadsheets(resolved_target_path or target_path, search_scope="account")
+        if (resolved_target_path or target_path)
+        else []
+    )
+    print(
+        "[Family Similarity] Starting analysis for "
+        f"{target_file_name} | family={dealership_id} | account-scope candidates={len(account_candidate_paths)}"
+    )
+
+    candidate_files: List[Dict[str, Any]] = []
+    collected_pairs: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+
+    if not family_slug:
+        warnings.append(
+            "Could not extract family slug from target filename. "
+            "Expected pattern: YYYY-MM-<accountID>-<A-|D-><id>.xlsx"
+        )
+
+    # Ensure target brief/campaign rows are persisted and mapped.
+    state_metadata = _persist_brief_and_campaigns(
+        campaign_brief=campaign_brief,
+        metadata=state_metadata,
+        create_run_if_missing=True,
+    )
+
+    account_results = _process_similarity_candidates(
+        target_brief=campaign_brief,
+        candidate_paths=account_candidate_paths,
+        strong_threshold=strong_threshold,
+        review_threshold=review_threshold,
+        state_metadata=state_metadata,
+    )
+    candidate_files.extend(account_results["candidate_files"])
+    collected_pairs.extend(account_results.get("collected_pairs", []) or [])
+    warnings.extend(account_results["warnings"])
+    state_metadata = account_results["metadata"]
+
+    account_resolved = resolve_global_campaign_pairs(
+        collected_pairs,
+        target_campaign_ids=[c.campaign_id for c in campaign_brief.campaigns],
+    )
+    account_qualifying = any(
+        float(item.get("similarity_score", 0.0)) >= qualifying_threshold
+        for item in (account_resolved.get("absolute_pairs", []) or [])
+        + (account_resolved.get("likely_pairs", []) or [])
+    )
+
+    widened_scope = None
+    widened_candidate_paths: List[str] = []
+    if widen_if_no_qualifying and not account_qualifying:
+        widened_scope = "group" if has_group_folder else "campaigns"
+        widened_candidate_paths = list_same_family_local_spreadsheets(
+            resolved_target_path or target_path,
+            search_scope=widened_scope,
+        )
+        print(
+            "[Family Similarity] No qualifying absolute/likely pairs in account scope. "
+            f"Widening scope to '{widened_scope}' with {len(widened_candidate_paths)} candidates."
+        )
+
+        if use_oem_filter and widened_candidate_paths:
+            oem_filter_result = _filter_candidates_with_oem_metadata(
+                target_path=resolved_target_path or target_path,
+                candidate_paths=widened_candidate_paths,
+                state_metadata=state_metadata,
+            )
+            warnings.extend(oem_filter_result.get("warnings", []))
+            filtered_paths = oem_filter_result.get("candidate_paths", widened_candidate_paths)
+            if filtered_paths:
+                widened_candidate_paths = filtered_paths
+            elif oem_fallback_if_empty:
+                warnings.append(
+                    "OEM hard filter returned zero candidates; falling back to unfiltered widened scope."
+                )
+            else:
+                widened_candidate_paths = []
+                warnings.append(
+                    "OEM hard filter returned zero candidates and fallback is disabled."
+                )
+
+        widened_results = _process_similarity_candidates(
+            target_brief=campaign_brief,
+            candidate_paths=widened_candidate_paths,
+            strong_threshold=strong_threshold,
+            review_threshold=review_threshold,
+            state_metadata=state_metadata,
+        )
+        candidate_files.extend(widened_results["candidate_files"])
+        collected_pairs.extend(widened_results.get("collected_pairs", []) or [])
+        warnings.extend(widened_results["warnings"])
+        state_metadata = widened_results["metadata"]
+
+    candidate_files.sort(key=lambda item: float(item.get("file_similarity_score", 0.0)), reverse=True)
+    resolved = resolve_global_campaign_pairs(
+        collected_pairs,
+        target_campaign_ids=[c.campaign_id for c in campaign_brief.campaigns],
+    )
+    absolute_pairs = resolved.get("absolute_pairs", []) or []
+    likely_pairs = resolved.get("likely_pairs", []) or []
+    review_pairs = resolved.get("review_pairs", []) or []
+    unpaired_targets = resolved.get("unpaired_targets", []) or []
+    strong_matches = resolved.get("strong_matches", []) or []
+    review_matches = resolved.get("review_matches", []) or []
+
+    print(
+        "[Family Similarity] Pairing summary: "
+        f"absolute={len(absolute_pairs)} likely={len(likely_pairs)} "
+        f"review={len(review_pairs)} unpaired={len(unpaired_targets)}"
+    )
+
+    payload = {
+        "target_file_name": target_file_name,
+        "target_file_path": resolved_target_path or target_path,
+        "dealership_name": campaign_brief.dealership_name,
+        "dealership_family_id": dealership_id,
+        "spreadsheet_instance_id": spreadsheet_instance_id,
+        "task_type": campaign_brief.task_type,
+        "thresholds": {
+            "strong": strong_threshold,
+            "review": review_threshold,
+            "absolute": strong_threshold,
+            "likely": 0.70,
+        },
+        "discovery_config": {
+            "qualifying_threshold": qualifying_threshold,
+            "widen_if_no_qualifying": widen_if_no_qualifying,
+            "widened_scope": widened_scope,
+            "use_oem_filter": use_oem_filter,
+            "oem_fallback_if_empty": oem_fallback_if_empty,
+        },
+        "hierarchy_context": hierarchy_context,
+        "candidate_files": candidate_files,
+        "absolute_pairs": absolute_pairs,
+        "likely_pairs": likely_pairs,
+        "review_pairs": review_pairs,
+        "unpaired_targets": unpaired_targets,
+        "strong_matches": strong_matches,
+        "review_matches": review_matches,
+        "candidates_processed": len(candidate_files),
+        "candidates_discovered": len(account_candidate_paths) + len(widened_candidate_paths),
+        "warnings": warnings,
+    }
+    return {
+        "family_similarity": payload,
+        "next": "family_similarity_report",
+        "next_node": "family_similarity_analysis",
+        "metadata": state_metadata,
+    }
+
+
+def family_similarity_report_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Persist family-similarity JSON/TXT outputs and end similarity branch.
+    """
+    campaign_brief = state.campaign_brief
+    payload = state.family_similarity.copy() if isinstance(state.family_similarity, dict) else {}
+    state_metadata = _copy_metadata(state.metadata)
+    if not campaign_brief:
+        payload["warnings"] = payload.get("warnings", []) + [
+            "Missing campaign_brief; report files were not generated."
+        ]
+        return {
+            "family_similarity": payload,
+            "next": "final_results",
+            "next_node": "family_similarity_report",
+            "metadata": state_metadata,
+        }
+
+    try:
+        output_paths = write_family_similarity_outputs(campaign_brief, payload)
+        payload.update(output_paths)
+        print(
+            "[Family Similarity] Outputs written: "
+            f"json={output_paths.get('json_path')} report={output_paths.get('report_path')}"
+        )
+    except Exception as exc:
+        warnings = payload.get("warnings", [])
+        warnings.append(f"Failed to write similarity outputs: {exc}")
+        payload["warnings"] = warnings
+        print(f"[Family Similarity] Failed to write outputs: {exc}")
+
+    state_metadata = _persist_similarity_matches(
+        campaign_brief=campaign_brief,
+        family_similarity_payload=payload,
+        metadata=state_metadata,
+    )
+
+    return {
+        "family_similarity": payload,
+        "next": "final_results",
+        "next_node": "family_similarity_report",
+        "metadata": state_metadata,
+    }
+
+
+def _parse_json_object(content: str) -> Optional[Dict[str, Any]]:
+    text = str(content or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        json_match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not json_match:
+            return None
+        try:
+            parsed = json.loads(json_match.group())
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+
+
+def _compact_similarity_matches_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Send specialists a smaller JSON payload for faster LLM turns."""
+    def _compact_match(item: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "target_campaign_id": item.get("target_campaign_id"),
+            "candidate_campaign_id": item.get("candidate_campaign_id"),
+            "file_name": item.get("file_name"),
+            "similarity_score": item.get("similarity_score"),
+            "similarity_percent": item.get("similarity_percent"),
+            "scoring_path": item.get("scoring_path"),
+            "pair_status": item.get("pair_status"),
+            "pair_basis": item.get("pair_basis"),
+            "style_direction_similarity": item.get("style_direction_similarity"),
+            "campaign_wording_similarity": item.get("campaign_wording_similarity"),
+            "dealership_relationship": item.get("dealership_relationship"),
+            "reference_strength": item.get("reference_strength", item.get("reference_id_boost")),
+            "reference_boost_reasons": item.get("reference_boost_reasons", []),
+            "has_copy_refer_signal": item.get("has_copy_refer_signal", False),
+        }
+
+    return {
+        "target_file_name": payload.get("target_file_name"),
+        "dealership_name": payload.get("dealership_name"),
+        "dealership_family_id": payload.get("dealership_family_id"),
+        "task_type": payload.get("task_type"),
+        "absolute_pairs": [
+            _compact_match(item)
+            for item in (payload.get("absolute_pairs", []) or [])
+            if isinstance(item, dict)
+        ],
+        "likely_pairs": [
+            _compact_match(item)
+            for item in (payload.get("likely_pairs", []) or [])
+            if isinstance(item, dict)
+        ],
+        "strong_matches": [
+            _compact_match(item)
+            for item in (payload.get("strong_matches", []) or [])
+            if isinstance(item, dict)
+        ],
+        "review_matches": [
+            _compact_match(item)
+            for item in (
+                payload.get("review_pairs", [])
+                or payload.get("review_matches", [])
+                or []
+            )
+            if isinstance(item, dict)
+        ],
+        "unpaired_targets": list(payload.get("unpaired_targets", []) or []),
+    }
+
+
+def _invoke_similarity_specialist(config_path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Single-turn specialist LLM call returning parsed JSON (or empty dict on failure)."""
+    config = load_agent_config(config_path)
+    system_prompt = config.get("prompt", "")
+    specialist_name = config.get("name", Path(config_path).stem)
+    llm = create_chat_model(
+        provider=get_primary_provider(),
+        model=os.getenv("LLM_MODEL", DEFAULT_MODEL),
+        temperature=DEFAULT_TEMPERATURE,
+        max_tokens=min(TASK_AGENT_MAX_TOKENS, 4000),
+    )
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(
+            content=(
+                f"Analyze these family-similarity matches as {specialist_name}. "
+                "Return strict JSON only.\n\n"
+                f"{json.dumps(payload, indent=2, ensure_ascii=False)}"
+            )
+        ),
+    ]
+    try:
+        response = llm.invoke(messages)
+        content = getattr(response, "content", response)
+        if isinstance(content, list):
+            content = "".join(
+                str(part.get("text", part)) if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        parsed = _parse_json_object(str(content or ""))
+        return parsed or {}
+    except Exception as exc:
+        print(f"[Family Similarity] Specialist '{specialist_name}' failed: {exc}")
+        return {"error": str(exc)}
+
+
+def _match_key(item: Dict[str, Any]) -> str:
+    return (
+        f"{item.get('target_campaign_id', '')}|"
+        f"{item.get('candidate_campaign_id', '')}|"
+        f"{item.get('file_name', '')}"
+    )
+
+
+def _merge_specialist_notes(
+    matches: List[Dict[str, Any]],
+    specialist_payloads: Dict[str, Dict[str, Any]],
+    list_key: str,
+) -> None:
+    lookups: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for specialist, payload in specialist_payloads.items():
+        enriched = payload.get(list_key, []) if isinstance(payload, dict) else []
+        lookup: Dict[str, Dict[str, Any]] = {}
+        if isinstance(enriched, list):
+            for item in enriched:
+                if isinstance(item, dict):
+                    lookup[_match_key(item)] = item
+        lookups[specialist] = lookup
+
+    for item in matches:
+        if not isinstance(item, dict):
+            continue
+        key = _match_key(item)
+        notes: List[str] = []
+        evidence: List[str] = []
+        for specialist in ("reference", "style", "wording"):
+            candidate = lookups.get(specialist, {}).get(key, {})
+            note = str(candidate.get("specialist_notes", "")).strip()
+            if note:
+                notes.append(f"{specialist}: {note}")
+            points = candidate.get("evidence_points", []) if isinstance(candidate, dict) else []
+            if isinstance(points, list):
+                evidence.extend(str(v) for v in points if str(v).strip())
+        if notes:
+            item["specialist_notes"] = notes
+        if evidence:
+            # Temporary merge bag for synthesizer; final evidence comes from synthesizer.
+            item["specialist_evidence_points"] = evidence[:8]
+
+
+def family_similarity_agent_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Parallel specialist enrichment + synthesizer for similarity matches.
+    Specialists: reference, style/assets, wording. Main agent merges final narrative.
+    """
+    payload = state.family_similarity.copy() if isinstance(state.family_similarity, dict) else {}
+    state_metadata = _copy_metadata(state.metadata)
+    strong_matches = payload.get("strong_matches", []) or []
+    review_matches = payload.get("review_matches", []) or []
+    absolute_pairs = payload.get("absolute_pairs", []) or []
+    likely_pairs = payload.get("likely_pairs", []) or []
+    review_pairs = payload.get("review_pairs", []) or []
+
+    if not strong_matches and not review_matches and not absolute_pairs and not likely_pairs and not review_pairs:
+        return {
+            "family_similarity": payload,
+            "next": "family_similarity_report",
+            "next_node": "family_similarity_agent",
+            "metadata": state_metadata,
+        }
+
+    compact_payload = _compact_similarity_matches_payload(payload)
+    specialist_jobs = [
+        ("reference", "agents/family_sim_reference_agent.yaml"),
+        ("style", "agents/family_sim_style_agent.yaml"),
+        ("wording", "agents/family_sim_wording_agent.yaml"),
+    ]
+    specialist_results: Dict[str, Dict[str, Any]] = {}
+    print(
+        "[Family Similarity] Running specialists in order "
+        "(reference -> style -> wording), then synthesizer..."
+    )
+    for name, path in specialist_jobs:
+        print(f"[Family Similarity] Specialist '{name}' starting...")
+        try:
+            result_payload = _invoke_similarity_specialist(path, compact_payload) or {}
+            specialist_results[name] = result_payload
+            ok = "error" not in result_payload
+            print(
+                f"[Family Similarity] Specialist '{name}' "
+                f"{'delivered' if ok else 'failed'}."
+            )
+        except Exception as exc:
+            specialist_results[name] = {"error": str(exc)}
+            print(f"[Family Similarity] Specialist '{name}' raised: {exc}")
+
+    for list_key in ("absolute_pairs", "likely_pairs", "review_pairs", "strong_matches", "review_matches"):
+        matches = payload.get(list_key, []) or []
+        if isinstance(matches, list):
+            _merge_specialist_notes(matches, specialist_results, list_key)
+            payload[list_key] = matches
+
+    payload["specialist_outputs"] = {
+        name: {
+            "ok": "error" not in (result or {}),
+            "absolute_count": len((result or {}).get("absolute_pairs", []) or []),
+            "likely_count": len((result or {}).get("likely_pairs", []) or []),
+            "strong_count": len((result or {}).get("strong_matches", []) or []),
+            "review_count": len(
+                (result or {}).get("review_pairs", [])
+                or (result or {}).get("review_matches", [])
+                or []
+            ),
+            "error": (result or {}).get("error"),
+        }
+        for name, result in specialist_results.items()
+    }
+    print(
+        "[Family Similarity] All specialists finished. "
+        "Passing merged notes to main similarity synthesizer..."
+    )
+
+    synthesizer = create_agent_from_config(
+        "agents/family_similarity_agent.yaml",
+        get_available_tools("family_similarity_agent"),
+    )
+    agent_state = state.model_copy()
+    if agent_state.messages is None:
+        agent_state.messages = []
+
+    synthesis_payload = {
+        "target_file_name": payload.get("target_file_name"),
+        "dealership_name": payload.get("dealership_name"),
+        "dealership_family_id": payload.get("dealership_family_id"),
+        "task_type": payload.get("task_type"),
+        "absolute_pairs": payload.get("absolute_pairs", []),
+        "likely_pairs": payload.get("likely_pairs", []),
+        "review_pairs": payload.get("review_pairs", payload.get("review_matches", [])),
+        "unpaired_targets": payload.get("unpaired_targets", []),
+        "strong_matches": payload.get("strong_matches", []),
+        "review_matches": payload.get("review_matches", []),
+        "specialist_outputs": payload.get("specialist_outputs", {}),
+    }
+    agent_state.messages = agent_state.messages + [
+        {
+            "role": "user",
+            "content": (
+                "Synthesize specialist notes into final `match_reason` and `evidence_points` "
+                "for every paired item in `absolute_pairs`, `likely_pairs`, `review_pairs` "
+                "(and compatibility lists `strong_matches` / `review_matches`). "
+                "Keep scores and pair_status unchanged. Return strict JSON only.\n\n"
+                f"{json.dumps(synthesis_payload, indent=2, ensure_ascii=False)}"
+            ),
+        }
+    ]
+
+    result = synthesizer(agent_state)
+    updated_messages = result.get("messages", state.messages)
+
+    assistant_content = ""
+    if isinstance(updated_messages, list):
+        for msg in reversed(updated_messages):
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                assistant_content = str(msg.get("content", "") or "").strip()
+                if assistant_content:
+                    break
+
+    parsed_payload = _parse_json_object(assistant_content)
+    if isinstance(parsed_payload, dict):
+        for list_key in ("absolute_pairs", "likely_pairs", "review_pairs", "strong_matches", "review_matches"):
+            existing = payload.get(list_key, []) or []
+            enriched = parsed_payload.get(list_key, []) if isinstance(parsed_payload.get(list_key), list) else []
+            enriched_lookup = {
+                _match_key(item): item
+                for item in enriched
+                if isinstance(item, dict)
+            }
+            merged: List[Dict[str, Any]] = []
+            for item in existing:
+                if not isinstance(item, dict):
+                    continue
+                candidate = enriched_lookup.get(_match_key(item), {})
+                merged_item = dict(item)
+                reason = str(candidate.get("match_reason", "")).strip() if isinstance(candidate, dict) else ""
+                evidence = candidate.get("evidence_points", []) if isinstance(candidate, dict) else []
+                if reason:
+                    merged_item["match_reason"] = reason
+                if isinstance(evidence, list) and evidence:
+                    merged_item["evidence_points"] = [str(v) for v in evidence if str(v).strip()][:4]
+                merged_item.pop("specialist_evidence_points", None)
+                merged.append(merged_item)
+            payload[list_key] = merged
+    else:
+        warnings = payload.get("warnings", [])
+        warnings.append("Family similarity synthesizer response was not valid JSON; keeping score-only matches.")
+        payload["warnings"] = warnings
+
+    return {
+        "family_similarity": payload,
+        "next": "family_similarity_report",
+        "next_node": "family_similarity_agent",
+        "messages": updated_messages,
+        "metadata": state_metadata,
+    }
 
 
 def create_campaign_workflow() -> Any:
@@ -1384,14 +2463,30 @@ def create_campaign_workflow() -> Any:
     workflow.add_node("campaign_update_agent", campaign_update_agent)
     workflow.add_node("diagnosis_formatter", diagnosis_formatter_node)
     workflow.add_node("document_creator_agent", document_creator_node)
+    workflow.add_node("family_similarity_analysis", family_similarity_analysis_node)
+    workflow.add_node("family_similarity_agent", family_similarity_agent_node)
+    workflow.add_node("family_similarity_report", family_similarity_report_node)
     workflow.add_node("final_results", final_results_node)
     
     # Set entry point
     workflow.set_entry_point("brief_creator")
     
     # Add edges
-    # Brief creator always goes to router
-    workflow.add_edge("brief_creator", "router")
+    # Brief creator routes conditionally:
+    # BRIEF_POST_PARSE_ROUTE=1 -> original analyzer route
+    # BRIEF_POST_PARSE_ROUTE=0 -> similarity-only route
+    def route_after_brief_creator(state: AgentState) -> str:
+        route_value = str(os.getenv(POST_PARSE_ROUTE_ENV, "1")).strip()
+        return "family_similarity_analysis" if route_value == "0" else "router"
+
+    workflow.add_conditional_edges(
+        "brief_creator",
+        route_after_brief_creator,
+        {
+            "router": "router",
+            "family_similarity_analysis": "family_similarity_analysis",
+        },
+    )
     
     # Router conditionally routes to one of the three agents
     def route_to_agent(state: AgentState) -> str:
@@ -1458,6 +2553,11 @@ def create_campaign_workflow() -> Any:
     
     # Document creator agent always goes to final_results
     workflow.add_edge("document_creator_agent", "final_results")
+
+    # Similarity-only branch ends after report generation.
+    workflow.add_edge("family_similarity_analysis", "family_similarity_agent")
+    workflow.add_edge("family_similarity_agent", "family_similarity_report")
+    workflow.add_edge("family_similarity_report", "final_results")
     
     # Final results node always ends the workflow
     workflow.add_edge("final_results", END)
