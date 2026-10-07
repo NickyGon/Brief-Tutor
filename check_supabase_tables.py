@@ -40,6 +40,7 @@ TABLES_TO_CHECK = [
     "analysis_runs",
     "campaign_similarity",
     "campaign_diagnoses",
+    "similarity_agent_cache",
 ]
 
 

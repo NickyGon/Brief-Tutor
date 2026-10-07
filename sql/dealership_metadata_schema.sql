@@ -40,5 +40,8 @@ create index if not exists idx_dealership_accounts_family on public.dealership_a
 create index if not exists idx_dealership_account_oems_account on public.dealership_account_oems(account_fk);
 
 -- Optional seed guidance:
--- - Set handles_all_oems=true for broad accounts (equivalent to OEM value "All").
+-- - Set handles_all_oems=true for broad accounts (equivalent to OEM value "All"/"NA").
 -- - Use oem_family='NA' when no specific OEM family applies.
+-- - oem may be a single brand or comma-separated brands in one row (e.g. "GMC, Buick").
+--   Prefer one OEM per row when practical; the app also splits comma-separated values.
+-- - OEM value "NA" or "All" means the account works with all OEMs.

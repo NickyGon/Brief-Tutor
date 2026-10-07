@@ -108,7 +108,18 @@ Similarity score strategy (dual path + absolute pairing):
   - `unpaired_targets`: no acceptable pair
 - File ranking uses strongest assigned pair score so campaign count does not dilute similarity
 
-Narrative enrichment uses three parallel specialists (reference, style/assets, wording) feeding a synthesizer agent.
+Narrative enrichment uses three ordered specialists (reference, style/assets, wording) feeding a synthesizer agent.
+When Supabase is enabled, specialist/synthesizer narratives are cached in `similarity_agent_cache` and reused for:
+- repeated target `A-/D-` brief IDs with the same candidate set
+- same account fallback
+- optional same OEM-family fallback
+
+Apply `sql/similarity_agent_cache_schema.sql` in Supabase SQL Editor once.
+Controls:
+- `FAMILY_SIM_AGENT_CACHE_ENABLED` (default `true`)
+- `FAMILY_SIM_AGENT_CACHE_MAX_AGE_HOURS` (default `168`)
+- `FAMILY_SIM_AGENT_CACHE_ACCOUNT_FALLBACK` (default `true`)
+- `FAMILY_SIM_AGENT_CACHE_OEM_FALLBACK` (default `true`)
 
 ### Hierarchical Similarity Discovery
 
@@ -120,14 +131,20 @@ The similarity-only branch uses hierarchical candidate discovery with filename p
   - `2026-06-tonydivinousedcarsntrucks-D-94095.xlsx`
 - Search order:
   1. same accountID folder
-  2. if no qualifying match, widen to:
+  2. if no qualifying match, prioritize OEM-compatible accounts from Supabase
+     (`dealership_account_oems.oem` may be comma-separated or `NA`/`All`;
+     also matches `dealership_accounts.oem_family`), including those accounts'
+     group folders when present
+  3. if still no qualifying match, widen to remaining:
      - sibling account folders in the same group folder (when grouped), or
      - sibling account/group folders under `Campaigns` (when ungrouped)
+  - Step 2 stops early when absolute/likely pairs are found in OEM-prioritized folders
 
 Optional discovery controls:
 - `FAMILY_SIM_WIDEN_IF_NO_QUALIFYING` (default `true`)
 - `FAMILY_SIM_QUALIFYING_THRESHOLD` (default `0.80`)
-- `FAMILY_SIM_USE_OEM_FILTER` (default `true`)
+- `FAMILY_SIM_OEM_PRIORITIZE` (default `true`) — search OEM-matched accounts/groups before other folders
+- `FAMILY_SIM_USE_OEM_FILTER` (default `true`) — hard-filter remaining widened candidates by OEM metadata
 - `FAMILY_SIM_OEM_FALLBACK_IF_EMPTY` (default `true`)
 
 The same filename parser is reused by campaign-update previous-brief resolution logic to keep `A-` and `D-` handling consistent.
@@ -141,13 +158,16 @@ For wider-scope matching accuracy, this project supports Supabase-seeded dealers
 - `dealership_account_oems`
 
 Behavior in widened searches:
-- hard OEM/OEM-family compatibility filter first
-- fallback to broader candidates when filter returns empty (configurable)
+- after account-scope fails, prioritize local folders for OEM-compatible accountIDs
+  (and their group folders) from Supabase metadata
+- stop early if those prioritized folders already produce absolute/likely pairs
+- otherwise continue to remaining group/Campaigns folders, with an OEM hard filter
+  and optional fallback when the filter returns empty
 
 Special handling:
-- multi-OEM accounts use `dealership_account_oems`
-- accounts handling broadly set `handles_all_oems=true` (equivalent to `All`)
-- non-family accounts use `oem_family='NA'`
+- multi-OEM accounts use `dealership_account_oems` (one OEM per row, or comma-separated in `oem`)
+- `oem` values `NA`/`All`, or `handles_all_oems=true`, mean compatible with all OEMs
+- matching also uses `dealership_accounts.oem_family` when both sides are non-`NA`
 
 ### Supabase Connection Scaffold
 

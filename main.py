@@ -34,7 +34,7 @@ def main():
     print("\n[Setup] Workflow will be created at run time (see LangSmith trace: campaign_brief_workflow).")
     
     # Get spreadsheet path
-    spreadsheet_path = "Campaigns/Steve Schmitt Group/steveschmittinchighland/2026-07-steveschmittinchighland-D-101822.xlsx"  # User will add the path here
+    spreadsheet_path = "Campaigns/Ourisman - Virginia Group/ourismanbuickgmc/2026-07-ourismanbuickgmc-D-101361.xlsx"  # User will add the path here
     
     if not spreadsheet_path:
         print("\n⚠️  WARNING: spreadsheet_path is not set!")

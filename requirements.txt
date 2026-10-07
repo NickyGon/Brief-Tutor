@@ -9,6 +9,9 @@ qdrant-client
 openpyxl
 pydantic
 python-dotenv
+fastapi
+uvicorn
+truststore
 pandas
 pyyaml
 pypdf

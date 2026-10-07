@@ -1,10 +1,11 @@
 """
 Tools for the LangGraph agent workflow.
 """
-from typing import List, Dict, Optional, Set, Any
+from typing import List, Dict, Optional, Set, Any, Iterable
 from langchain.tools import tool
 from graph.models import Campaign, CampaignBrief, OfferDetails, StyleDescriptions, Assets
 from graph.brief_naming import parse_brief_filename, resolve_spreadsheet_path
+from graph.progress import report_stage
 from collections import Counter
 from difflib import SequenceMatcher
 import re
@@ -457,13 +458,17 @@ def _parse_spreadsheet_internal(spreadsheet_path: str) -> dict:
     Returns:
         A dict with: task_type, asset_summary, dealership_name, content_11_20, campaigns.
     """
+    report_stage("read")
     use_custom_brief_mcp = (os.getenv("CUSTOM_BRIEF_MCP_ENABLED", "false").strip().lower() == "true")
     if use_custom_brief_mcp:
         print(f"[Spreadsheet Parser] Loading spreadsheet via custom MCP: {spreadsheet_path}")
         try:
             from graph.mcp_utils import parse_spreadsheet_via_custom_mcp
 
-            return parse_spreadsheet_via_custom_mcp(spreadsheet_path)
+            parsed = parse_spreadsheet_via_custom_mcp(spreadsheet_path)
+            if isinstance(parsed, dict) and "campaigns" in parsed:
+                report_stage("campaigns")
+            return parsed
         except Exception as exc:
             print(f"[Spreadsheet Parser] Custom MCP failed, falling back to existing parsers: {exc}")
 
@@ -473,7 +478,10 @@ def _parse_spreadsheet_internal(spreadsheet_path: str) -> dict:
         try:
             from graph.mcp_excel_sampling import parse_spreadsheet_via_mcp_sampling
 
-            return parse_spreadsheet_via_mcp_sampling(spreadsheet_path)
+            parsed = parse_spreadsheet_via_mcp_sampling(spreadsheet_path)
+            if isinstance(parsed, dict) and "campaigns" in parsed:
+                report_stage("campaigns")
+            return parsed
         except Exception as exc:
             print(f"[Spreadsheet Parser] MCP sampling failed, falling back to pandas parser: {exc}")
 
@@ -528,7 +536,8 @@ def _parse_spreadsheet_internal(spreadsheet_path: str) -> dict:
         print(f"[ERROR] Result is not JSON serializable: {str(e)}")
         # Fallback: use model_dump_json and parse back
         result_dict = json.loads(campaign_brief.model_dump_json())
-    
+
+    report_stage("campaigns")
     return result_dict
 
 
@@ -735,6 +744,76 @@ def list_same_family_local_spreadsheets(
             continue
 
         if resolved in seen:
+            continue
+        seen.add(resolved)
+        matched_files.append(resolved)
+
+    return sorted(matched_files)
+
+
+def list_local_spreadsheets_for_accounts(
+    target_path: str,
+    *,
+    account_ids: Optional[List[str]] = None,
+    group_names: Optional[List[str]] = None,
+    exclude_paths: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """
+    Find local .xlsx briefs under Campaigns for prioritized accountIDs / group folders.
+
+    Used after account-scope search fails: OEM-compatible accounts (and their groups)
+    are searched before scanning the rest of Campaigns.
+    """
+    hierarchy = classify_campaign_path_hierarchy(target_path)
+    campaigns_root_raw = hierarchy.get("campaigns_root")
+    target_resolved = str(hierarchy.get("target_file_path") or "")
+    if not campaigns_root_raw:
+        return []
+
+    campaigns_root = Path(str(campaigns_root_raw))
+    account_id_set = {
+        str(item).strip().lower()
+        for item in (account_ids or [])
+        if str(item).strip()
+    }
+    group_name_set = {
+        str(item).strip().lower()
+        for item in (group_names or [])
+        if str(item).strip()
+    }
+    if not account_id_set and not group_name_set:
+        return []
+
+    exclude: Set[str] = set()
+    for raw in list(exclude_paths or []):
+        try:
+            exclude.add(str(Path(raw).resolve()))
+        except Exception:
+            continue
+    if target_resolved:
+        try:
+            exclude.add(str(Path(target_resolved).resolve()))
+        except Exception:
+            pass
+
+    blocked_dirs = {".git", ".venv", "venv", "__pycache__", "node_modules"}
+    matched_files: List[str] = []
+    seen: Set[str] = set()
+
+    for path in _iter_candidate_xlsx_files(campaigns_root, blocked_dirs):
+        resolved = str(path.resolve())
+        if resolved in exclude or resolved in seen:
+            continue
+        try:
+            rel_parts = path.relative_to(campaigns_root).parts
+        except ValueError:
+            continue
+        folder_parts = [part.lower() for part in rel_parts[:-1]]
+        under_account = bool(account_id_set.intersection(folder_parts))
+        under_group = bool(group_name_set.intersection(folder_parts))
+        if not under_account and not under_group:
+            continue
+        if not parse_brief_filename(path.name):
             continue
         seen.add(resolved)
         matched_files.append(resolved)
@@ -1317,6 +1396,56 @@ def resolve_global_campaign_pairs(
     }
 
 
+def _summarize_brief_match(
+    target_brief: CampaignBrief,
+    candidate_brief: CampaignBrief,
+    assigned_pairs: List[Dict[str, Any]],
+    *,
+    likely_threshold: float,
+    review_threshold: float,
+) -> Dict[str, Any]:
+    """Score the two briefs as wholes. Extra campaigns on the longer brief are not zeros."""
+    target_count = len(target_brief.campaigns)
+    candidate_count = len(candidate_brief.campaigns)
+    smaller = min(target_count, candidate_count)
+    same_count = target_count == candidate_count and target_count > 0
+
+    def _kept(pair: Dict[str, Any], threshold: float) -> bool:
+        status = str(pair.get("pair_status") or "")
+        score = float(pair.get("similarity_score") or 0.0)
+        if status not in {"absolute", "likely", "review"}:
+            return False
+        return score >= threshold
+
+    review_pairs = [pair for pair in assigned_pairs if _kept(pair, review_threshold)]
+    likely_pairs = [
+        pair
+        for pair in assigned_pairs
+        if str(pair.get("pair_status") or "") in {"absolute", "likely"}
+        and float(pair.get("similarity_score") or 0.0) >= likely_threshold
+    ]
+    coverage = (min(len(review_pairs), smaller) / smaller) if smaller else 0.0
+    if same_count and len(review_pairs) >= target_count:
+        kind = "aligned"
+        pool = review_pairs
+    elif (not same_count) and smaller > 0 and len(likely_pairs) >= smaller:
+        kind = "complementation"
+        pool = likely_pairs
+    else:
+        kind = "none"
+        pool = review_pairs
+    score = (
+        sum(float(pair.get("similarity_score") or 0.0) for pair in pool) / len(pool)
+        if pool
+        else 0.0
+    )
+    return {
+        "brief_similarity_score": round(score, 6),
+        "match_kind": kind,
+        "coverage": round(coverage, 6),
+    }
+
+
 def compare_briefs_and_rank(
     target_brief: CampaignBrief,
     candidate_brief: CampaignBrief,
@@ -1370,6 +1499,13 @@ def compare_briefs_and_rank(
     ]
 
     assigned_pairs.sort(key=_pair_priority_key)
+    brief_match = _summarize_brief_match(
+        target_brief,
+        candidate_brief,
+        assigned_pairs,
+        likely_threshold=likely_threshold,
+        review_threshold=review_threshold,
+    )
     scored_by_score = sorted(
         scored_pairs,
         key=lambda item: float(item.get("similarity_score", 0.0) or 0.0),
@@ -1410,6 +1546,9 @@ def compare_briefs_and_rank(
         "strong_matches": strong_matches,
         "review_matches": review_pairs,
         "all_scored_pairs": scored_pairs,
+        "brief_similarity_score": brief_match["brief_similarity_score"],
+        "match_kind": brief_match["match_kind"],
+        "coverage": brief_match["coverage"],
     }
 
 
@@ -2821,31 +2960,18 @@ def write_document_to_file(
         JSON string with success status, file_path, and file_name
     """
     try:
-        project_root = Path(__file__).parent.parent
-        results_dir = project_root / "results"
-        results_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Ensure the file_name doesn't contain path separators (security)
-        if "/" in file_name or "\\" in file_name:
-            # Extract just the filename
-            file_name = Path(file_name).name
-        file_path = results_dir / file_name
-        
-        # Write the content to the file
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        
         result = {
             "success": True,
-            "file_path": str(file_path),
+            "file_path": "",
             "file_name": file_name,
             "document_type": document_type,
             "content_length": len(content),
-            "message": f"Successfully wrote {document_type} document to results/{file_name}"
+            "message": f"Stored {document_type} document {file_name} for Supabase.",
         }
-        
-        print(f"[Document Creator Tool] ✓ Wrote {document_type} document: {file_name} ({len(content)} characters)")
-        
+        from graph.document_sink import remember_document
+
+        remember_document(file_name, document_type, content)
+        print(f"[Document Creator Tool] Stored {document_type} document: {file_name} ({len(content)} characters)")
         return json.dumps(result, indent=2)
     
     except Exception as e:
