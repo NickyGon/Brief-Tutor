@@ -10,7 +10,21 @@ Set WORKFLOW_VERBOSE_CONSOLE=true for debug-level agent/tool dumps.
 from __future__ import annotations
 
 import os
+import sys
 from typing import Any, Dict
+
+
+def configure_stdio() -> None:
+    """Keep Unicode progress text from crashing on the Windows console."""
+    for name in ("stdout", "stderr"):
+        for stream in (getattr(sys, name, None), getattr(sys, f"__{name}__", None)):
+            reconfigure = getattr(stream, "reconfigure", None)
+            if reconfigure is None:
+                continue
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, OSError, ValueError):
+                continue
 
 
 def _env_flag(name: str, default: str = "false") -> bool:

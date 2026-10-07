@@ -19,11 +19,11 @@ class Assets(BaseModel):
     ot_6: str = Field(default="", description="The sixth of six additional assets for the campaign")
 
 class OfferDetails(BaseModel):
-    headline: str = Field(default="", description="The headline of the campaign", max_length=75)
-    offer: str = Field(default="", description="The offer of the campaign", max_length=100)
-    body: str = Field(default="", description="The body of the offer", max_length=10000)
-    cta: str = Field(default="", description="The call to action of the offer", max_length=30)
-    disclaimer: str = Field(default="", description="The disclaimer of the offer", max_length=10000)
+    headline: str = Field(default="", description="The headline of the campaign")
+    offer: str = Field(default="", description="The offer of the campaign")
+    body: str = Field(default="", description="The body of the offer")
+    cta: str = Field(default="", description="The call to action of the offer")
+    disclaimer: str = Field(default="", description="The disclaimer of the offer")
 
 class StyleDescriptions(BaseModel):
     asset_style_direction: str = Field(default="", description="A specific theme for the campaign's multiple assets to follow.")
@@ -80,6 +80,83 @@ class CampaignDiagnosis(BaseModel):
     )
 
 
+class FamilySimilarityCampaignMatch(BaseModel):
+    target_campaign_id: str = Field(..., description="Campaign ID from the target brief")
+    candidate_campaign_id: str = Field(..., description="Campaign ID from the candidate brief")
+    similarity_score: float = Field(..., description="Weighted similarity score in [0, 1]")
+    scoring_path: str = Field(
+        default="content",
+        description="Which scoring path was used: 'reference' (copy/refer ID) or 'content'",
+    )
+    pair_status: str = Field(
+        default="none",
+        description="Pairing decision: absolute | likely | review | none",
+    )
+    pair_basis: str = Field(
+        default="content",
+        description="Primary basis for the pair: reference | style_assets | content",
+    )
+    style_direction_similarity: float = Field(
+        ...,
+        description=(
+            "Combined StyleDirection section score in [0, 1]: "
+            "style direction / additional style / vehicle photography / assets"
+        ),
+    )
+    style_fields_similarity: float = Field(
+        default=0.0,
+        description="Similarity across style text columns in [0, 1]",
+    )
+    asset_structure_similarity: float = Field(
+        default=0.0,
+        description="Asset column similarity in [0, 1]",
+    )
+    campaign_wording_similarity: float = Field(
+        ...,
+        description="Campaign structure + offer wording similarity in [0, 1]",
+    )
+    dealership_relationship: float = Field(
+        ...,
+        description="Dealership/OEM/group proximity score in [0, 1] (10% weight)",
+    )
+    reference_strength: float = Field(
+        default=0.0,
+        description="Copy/refer ID signal strength in [0, 1] when scoring_path=reference",
+    )
+    reference_id_boost: float = Field(
+        default=0.0,
+        description="Compatibility alias for reference_strength",
+    )
+    reference_boost_reasons: List[str] = Field(
+        default_factory=list,
+        description="Why a copy/refer ID signal was applied",
+    )
+    has_copy_refer_signal: bool = Field(
+        default=False,
+        description="True when copy/refer cue wording + matching A-/D- IDs were found",
+    )
+    match_reason: str = Field(
+        default="",
+        description="Direct narrative reason why these campaigns are considered paired"
+    )
+    evidence_points: List[str] = Field(
+        default_factory=list,
+        description="Short evidence bullets grounded in assets/style/offer fields"
+    )
+
+
+class FamilySimilarityCandidate(BaseModel):
+    file_name: str = Field(..., description="Candidate spreadsheet filename")
+    file_path: str = Field(..., description="Candidate spreadsheet local path")
+    dealership_name: Optional[str] = Field(default=None, description="Dealership name parsed from candidate brief")
+    task_type: Optional[str] = Field(default=None, description="Task type parsed from candidate brief")
+    file_similarity_score: float = Field(..., description="Aggregate file-level similarity score in [0, 1]")
+    strongest_matches: List[FamilySimilarityCampaignMatch] = Field(
+        default_factory=list,
+        description="Top campaign matches for this candidate file"
+    )
+
+
 class AgentState(BaseModel):
     """State that flows through the agent graph."""
     messages: List[Dict[str, Any]] = Field(
@@ -125,4 +202,8 @@ class AgentState(BaseModel):
     diagnoses_json_path: Optional[str] = Field(
         default=None,
         description="Path to the diagnoses JSON file created by the diagnosis formatter"
+    )
+    family_similarity: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Output payload for the family similarity branch (toggle route 0)"
     )

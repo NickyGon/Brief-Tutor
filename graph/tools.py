@@ -1,10 +1,13 @@
 """
 Tools for the LangGraph agent workflow.
 """
-from typing import List, Dict, Optional, Set, Any
+from typing import List, Dict, Optional, Set, Any, Iterable
 from langchain.tools import tool
 from graph.models import Campaign, CampaignBrief, OfferDetails, StyleDescriptions, Assets
+from graph.brief_naming import parse_brief_filename, resolve_spreadsheet_path
+from graph.progress import report_stage
 from collections import Counter
+from difflib import SequenceMatcher
 import re
 import json
 import ast
@@ -455,13 +458,17 @@ def _parse_spreadsheet_internal(spreadsheet_path: str) -> dict:
     Returns:
         A dict with: task_type, asset_summary, dealership_name, content_11_20, campaigns.
     """
+    report_stage("read")
     use_custom_brief_mcp = (os.getenv("CUSTOM_BRIEF_MCP_ENABLED", "false").strip().lower() == "true")
     if use_custom_brief_mcp:
         print(f"[Spreadsheet Parser] Loading spreadsheet via custom MCP: {spreadsheet_path}")
         try:
             from graph.mcp_utils import parse_spreadsheet_via_custom_mcp
 
-            return parse_spreadsheet_via_custom_mcp(spreadsheet_path)
+            parsed = parse_spreadsheet_via_custom_mcp(spreadsheet_path)
+            if isinstance(parsed, dict) and "campaigns" in parsed:
+                report_stage("campaigns")
+            return parsed
         except Exception as exc:
             print(f"[Spreadsheet Parser] Custom MCP failed, falling back to existing parsers: {exc}")
 
@@ -471,7 +478,10 @@ def _parse_spreadsheet_internal(spreadsheet_path: str) -> dict:
         try:
             from graph.mcp_excel_sampling import parse_spreadsheet_via_mcp_sampling
 
-            return parse_spreadsheet_via_mcp_sampling(spreadsheet_path)
+            parsed = parse_spreadsheet_via_mcp_sampling(spreadsheet_path)
+            if isinstance(parsed, dict) and "campaigns" in parsed:
+                report_stage("campaigns")
+            return parsed
         except Exception as exc:
             print(f"[Spreadsheet Parser] MCP sampling failed, falling back to pandas parser: {exc}")
 
@@ -526,7 +536,8 @@ def _parse_spreadsheet_internal(spreadsheet_path: str) -> dict:
         print(f"[ERROR] Result is not JSON serializable: {str(e)}")
         # Fallback: use model_dump_json and parse back
         result_dict = json.loads(campaign_brief.model_dump_json())
-    
+
+    report_stage("campaigns")
     return result_dict
 
 
@@ -591,6 +602,1042 @@ def load_and_parse_spreadsheet_custom_mcp(spreadsheet_path: str) -> CampaignBrie
     from graph.mcp_utils import parse_spreadsheet_via_custom_mcp
 
     return parse_spreadsheet_via_custom_mcp(spreadsheet_path)
+
+
+def extract_family_slug_from_filename(spreadsheet_path: str) -> Optional[str]:
+    """
+    Extract accountID/family slug from filename convention:
+    YYYY-MM-<accountID>-<A-|D-><numeric_id>.xlsx
+    """
+    parsed = parse_brief_filename(spreadsheet_path)
+    if not parsed:
+        return None
+    return parsed.get("account_id")
+
+
+def extract_campaign_instance_id(spreadsheet_path: str) -> Optional[str]:
+    """Extract the A-/D- token from standard brief filenames."""
+    parsed = parse_brief_filename(spreadsheet_path)
+    if not parsed:
+        return None
+    return parsed.get("campaign_token")
+
+
+def _find_campaigns_root(path: Path) -> Optional[Path]:
+    for parent in [path] + list(path.parents):
+        if parent.name.lower() == "campaigns":
+            return parent
+    return None
+
+
+def classify_campaign_path_hierarchy(target_path: str) -> Dict[str, Any]:
+    """
+    Classify hierarchy context for target spreadsheet path.
+
+    Returns keys:
+      - target_file_path
+      - target_file_name
+      - account_id
+      - account_folder
+      - group_folder
+      - campaigns_root
+      - has_group_folder
+    """
+    project_root = Path(__file__).parent.parent
+    resolved_target = resolve_spreadsheet_path(
+        target_path,
+        project_root=project_root,
+        strict=False,
+    )
+    parsed = parse_brief_filename(resolved_target.name) or {}
+    account_folder = resolved_target.parent
+    campaigns_root = _find_campaigns_root(account_folder)
+    group_folder: Optional[Path] = None
+
+    if campaigns_root and account_folder.parent != campaigns_root:
+        # file <- account folder <- group folder <- Campaigns
+        if campaigns_root in account_folder.parents:
+            group_candidate = account_folder.parent
+            if group_candidate != campaigns_root:
+                group_folder = group_candidate
+
+    return {
+        "target_file_path": str(resolved_target),
+        "target_file_name": resolved_target.name,
+        "account_id": parsed.get("account_id"),
+        "campaign_token": parsed.get("campaign_token"),
+        "account_folder": str(account_folder),
+        "group_folder": str(group_folder) if group_folder else None,
+        "campaigns_root": str(campaigns_root) if campaigns_root else None,
+        "has_group_folder": bool(group_folder),
+    }
+
+
+def _iter_candidate_xlsx_files(root: Path, blocked_dirs: Set[str]) -> List[Path]:
+    files: List[Path] = []
+    if not root.exists():
+        return files
+    for path in root.rglob("*.xlsx"):
+        if any(part.lower() in blocked_dirs for part in path.parts):
+            continue
+        files.append(path.resolve())
+    return files
+
+
+def list_same_family_local_spreadsheets(
+    target_path: str,
+    search_scope: str = "account",
+) -> List[str]:
+    """
+    Return local .xlsx candidates using hierarchical search scopes:
+      - account: same accountID folder only
+      - group: other account folders under the same group folder
+      - campaigns: siblings under Campaigns root
+    """
+    hierarchy = classify_campaign_path_hierarchy(target_path)
+    account_id = str(hierarchy.get("account_id") or "").strip().lower()
+    target_resolved = str(hierarchy.get("target_file_path") or "")
+    account_folder = Path(str(hierarchy.get("account_folder") or ""))
+    group_folder_raw = hierarchy.get("group_folder")
+    campaigns_root_raw = hierarchy.get("campaigns_root")
+    group_folder = Path(group_folder_raw) if group_folder_raw else None
+    campaigns_root = Path(campaigns_root_raw) if campaigns_root_raw else None
+
+    if not target_resolved or not account_folder:
+        return []
+
+    blocked_dirs = {".git", ".venv", "venv", "__pycache__", "node_modules"}
+    candidate_files: List[Path] = []
+
+    scope = str(search_scope or "account").strip().lower()
+    if scope == "account":
+        candidate_files = _iter_candidate_xlsx_files(account_folder, blocked_dirs)
+    elif scope == "group":
+        if group_folder:
+            candidate_files = _iter_candidate_xlsx_files(group_folder, blocked_dirs)
+            candidate_files = [p for p in candidate_files if account_folder not in p.parents]
+        else:
+            candidate_files = []
+    elif scope == "campaigns":
+        if campaigns_root:
+            candidate_files = _iter_candidate_xlsx_files(campaigns_root, blocked_dirs)
+            candidate_files = [p for p in candidate_files if account_folder not in p.parents]
+        else:
+            candidate_files = []
+    else:
+        raise ValueError(f"Unsupported search_scope '{search_scope}'")
+
+    matched_files: List[str] = []
+    seen: Set[str] = set()
+    for path in candidate_files:
+        resolved = str(path.resolve())
+        if resolved == target_resolved:
+            continue
+
+        parsed = parse_brief_filename(path.name)
+        if not parsed:
+            continue
+
+        # Keep same-account files in account scope. Wider scopes intentionally
+        # include other accountIDs for fallback search.
+        if scope == "account" and account_id and parsed.get("account_id") != account_id:
+            continue
+
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        matched_files.append(resolved)
+
+    return sorted(matched_files)
+
+
+def list_local_spreadsheets_for_accounts(
+    target_path: str,
+    *,
+    account_ids: Optional[List[str]] = None,
+    group_names: Optional[List[str]] = None,
+    exclude_paths: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """
+    Find local .xlsx briefs under Campaigns for prioritized accountIDs / group folders.
+
+    Used after account-scope search fails: OEM-compatible accounts (and their groups)
+    are searched before scanning the rest of Campaigns.
+    """
+    hierarchy = classify_campaign_path_hierarchy(target_path)
+    campaigns_root_raw = hierarchy.get("campaigns_root")
+    target_resolved = str(hierarchy.get("target_file_path") or "")
+    if not campaigns_root_raw:
+        return []
+
+    campaigns_root = Path(str(campaigns_root_raw))
+    account_id_set = {
+        str(item).strip().lower()
+        for item in (account_ids or [])
+        if str(item).strip()
+    }
+    group_name_set = {
+        str(item).strip().lower()
+        for item in (group_names or [])
+        if str(item).strip()
+    }
+    if not account_id_set and not group_name_set:
+        return []
+
+    exclude: Set[str] = set()
+    for raw in list(exclude_paths or []):
+        try:
+            exclude.add(str(Path(raw).resolve()))
+        except Exception:
+            continue
+    if target_resolved:
+        try:
+            exclude.add(str(Path(target_resolved).resolve()))
+        except Exception:
+            pass
+
+    blocked_dirs = {".git", ".venv", "venv", "__pycache__", "node_modules"}
+    matched_files: List[str] = []
+    seen: Set[str] = set()
+
+    for path in _iter_candidate_xlsx_files(campaigns_root, blocked_dirs):
+        resolved = str(path.resolve())
+        if resolved in exclude or resolved in seen:
+            continue
+        try:
+            rel_parts = path.relative_to(campaigns_root).parts
+        except ValueError:
+            continue
+        folder_parts = [part.lower() for part in rel_parts[:-1]]
+        under_account = bool(account_id_set.intersection(folder_parts))
+        under_group = bool(group_name_set.intersection(folder_parts))
+        if not under_account and not under_group:
+            continue
+        if not parse_brief_filename(path.name):
+            continue
+        seen.add(resolved)
+        matched_files.append(resolved)
+
+    return sorted(matched_files)
+
+
+def parse_local_spreadsheet_to_campaign_brief(spreadsheet_path: str) -> CampaignBrief:
+    """
+    Parse a local spreadsheet path using the same internal parser used by brief creator.
+    """
+    project_root = Path(__file__).parent.parent
+    resolved_path = resolve_spreadsheet_path(
+        spreadsheet_path,
+        project_root=project_root,
+        strict=False,
+    )
+    parsed = _parse_spreadsheet_internal(str(resolved_path))
+    if isinstance(parsed, CampaignBrief):
+        parsed.spreadsheet_path = str(resolved_path)
+        return parsed
+    if isinstance(parsed, dict):
+        parsed["spreadsheet_path"] = str(resolved_path)
+        return CampaignBrief(**parsed)
+    raise TypeError(f"Unexpected parsed spreadsheet payload type: {type(parsed)}")
+
+
+def _normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip().lower()
+    return re.sub(r"\s+", " ", text)
+
+
+def _join_non_empty_values(values: List[Any]) -> str:
+    parts = [_normalize_text(v) for v in values if _normalize_text(v)]
+    return " | ".join(parts)
+
+
+def _extract_campaign_text_sections(campaign: Campaign) -> Dict[str, str]:
+    assets_data = campaign.assets.model_dump(mode="python") if hasattr(campaign.assets, "model_dump") else {}
+    style_data = (
+        campaign.style_descriptions.model_dump(mode="python")
+        if hasattr(campaign.style_descriptions, "model_dump")
+        else {}
+    )
+    offer_data = (
+        campaign.offer_details.model_dump(mode="python")
+        if hasattr(campaign.offer_details, "model_dump")
+        else {}
+    )
+    return {
+        "assets": _join_non_empty_values([assets_data.get(k, "") for k in sorted(assets_data.keys())]),
+        "style": _join_non_empty_values([style_data.get(k, "") for k in sorted(style_data.keys())]),
+        "offer": _join_non_empty_values([offer_data.get(k, "") for k in sorted(offer_data.keys())]),
+    }
+
+
+def _text_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return float(SequenceMatcher(a=a, b=b).ratio())
+
+
+def _binary_presence_vector(values: List[Any]) -> List[int]:
+    return [1 if _normalize_text(v) else 0 for v in values]
+
+
+def _vector_similarity(a: List[int], b: List[int]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    matches = sum(1 for left, right in zip(a, b) if left == right)
+    return float(matches / len(a)) if a else 0.0
+
+
+_CAMPAIGN_REF_ID_PATTERN = re.compile(
+    r"(?i)\b([AD])\s*[-–—]?\s*(\d{5,12})\b"
+)
+_COPY_REFER_CUE_PATTERN = re.compile(
+    r"(?i)\b("
+    r"copy\s+from|copied\s+from|copying\s+from|copy\b|"
+    r"refer\s+to|refers\s+to|referred\s+to|reference(?:d)?|refer\b|"
+    r"based\s+on|use\s+(?:as\s+)?(?:base|template)|"
+    r"from\s+(?:campaign|brief)|see\s+(?:campaign|brief)|"
+    r"cu\s*:|match\s+(?:to|with)|same\s+as|duplicate(?:\s+of)?"
+    r")\b"
+)
+
+
+def _normalize_campaign_ref_id(letter: str, digits: str) -> str:
+    return f"{str(letter).strip().upper()}-{str(digits).strip()}"
+
+
+def _extract_referenced_campaign_ids(*texts: Any) -> set:
+    """Extract A-/D- campaign IDs referenced in free-text fields."""
+    found: set = set()
+    for text in texts:
+        normalized = str(text or "")
+        if not normalized.strip():
+            continue
+        for match in _CAMPAIGN_REF_ID_PATTERN.findall(normalized):
+            if isinstance(match, tuple) and len(match) >= 2:
+                found.add(_normalize_campaign_ref_id(match[0], match[1]))
+            elif isinstance(match, str) and match:
+                found.add(str(match).strip().upper())
+    return found
+
+
+def _extract_cued_reference_ids(*texts: Any) -> set:
+    """
+    Extract A-/D- IDs from fields that also contain copy/refer cue wording
+    (e.g. "Copy from D-12345", "Refer to A-99999").
+    """
+    found: set = set()
+    for text in texts:
+        normalized = str(text or "")
+        if not normalized.strip():
+            continue
+        if not _COPY_REFER_CUE_PATTERN.search(normalized):
+            continue
+        found |= _extract_referenced_campaign_ids(normalized)
+    return found
+
+
+def _campaign_reference_haystack(campaign: Campaign) -> List[str]:
+    style = campaign.style_descriptions
+    assets = campaign.assets.model_dump(mode="python")
+    return [
+        getattr(style, "asset_style_direction", "") or "",
+        getattr(style, "additional_style_information", "") or "",
+        getattr(style, "vehicle_photography", "") or "",
+        getattr(style, "logos", "") or "",
+        *[str(assets.get(key, "") or "") for key in sorted(assets.keys())],
+    ]
+
+
+def _briefs_share_account_or_group(target_brief: CampaignBrief, candidate_brief: CampaignBrief) -> bool:
+    target_family = extract_family_slug_from_filename(target_brief.spreadsheet_path or "")
+    candidate_family = extract_family_slug_from_filename(candidate_brief.spreadsheet_path or "")
+    if target_family and candidate_family and target_family == candidate_family:
+        return True
+    try:
+        target_hierarchy = classify_campaign_path_hierarchy(target_brief.spreadsheet_path or "")
+        candidate_hierarchy = classify_campaign_path_hierarchy(candidate_brief.spreadsheet_path or "")
+        target_group = str(target_hierarchy.get("group_folder") or "").strip().lower()
+        candidate_group = str(candidate_hierarchy.get("group_folder") or "").strip().lower()
+        if target_group and candidate_group and target_group == candidate_group:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _reference_path_signal(
+    target_campaign: Campaign,
+    candidate_campaign: Campaign,
+    target_brief: CampaignBrief,
+    candidate_brief: CampaignBrief,
+) -> Dict[str, Any]:
+    """
+    Detect copy/refer ID signals that should lead similarity scoring.
+
+    Same account/group required. Signal triggers when:
+      - both sides mention the same A-/D- ID in Style Direction (or related fields), or
+      - candidate references target brief ID and/or vice versa
+    Cue wording ("Copy from", "Refer to", etc.) increases strength but is not required
+    when the same referred ID is present on both sides.
+    """
+    empty = {
+        "scoring_path": "content",
+        "reference_strength": 0.0,
+        "reference_id_boost": 0.0,
+        "reference_boost_reasons": [],
+        "has_copy_refer_signal": False,
+    }
+
+    target_haystack = _campaign_reference_haystack(target_campaign)
+    candidate_haystack = _campaign_reference_haystack(candidate_campaign)
+    target_refs = _extract_referenced_campaign_ids(*target_haystack)
+    candidate_refs = _extract_referenced_campaign_ids(*candidate_haystack)
+    target_cued_refs = _extract_cued_reference_ids(*target_haystack)
+    candidate_cued_refs = _extract_cued_reference_ids(*candidate_haystack)
+
+    if not target_refs and not candidate_refs:
+        return empty
+
+    same_scope = _briefs_share_account_or_group(target_brief, candidate_brief)
+    if not same_scope:
+        print(
+            "[Family Similarity] Reference IDs found but skipped "
+            "(not same account/group): "
+            f"target={sorted(target_refs)[:3]} candidate={sorted(candidate_refs)[:3]}"
+        )
+        return empty
+
+    target_file_id = (extract_campaign_instance_id(target_brief.spreadsheet_path or "") or "").upper()
+    candidate_file_id = (extract_campaign_instance_id(candidate_brief.spreadsheet_path or "") or "").upper()
+
+    strength = 0.0
+    reasons: List[str] = []
+
+    shared_refs = sorted(target_refs & candidate_refs)
+    shared_cued_refs = sorted(target_cued_refs & candidate_cued_refs)
+    if shared_cued_refs:
+        strength = max(strength, 0.94)
+        reasons.append(
+            f"shared copy/refer ID(s) with cue wording: {', '.join(shared_cued_refs[:3])}"
+        )
+    elif shared_refs:
+        # Same referred ID in Style Direction (etc.) is enough to indicate pairing intent.
+        strength = max(strength, 0.90)
+        reasons.append(f"shared referred ID(s) in style/assets: {', '.join(shared_refs[:3])}")
+
+    candidate_points_to_target = bool(
+        target_file_id and (target_file_id in candidate_cued_refs or target_file_id in candidate_refs)
+    )
+    target_points_to_candidate = bool(
+        candidate_file_id and (candidate_file_id in target_cued_refs or candidate_file_id in target_refs)
+    )
+    cued_cross = bool(
+        (target_file_id and target_file_id in candidate_cued_refs)
+        or (candidate_file_id and candidate_file_id in target_cued_refs)
+    )
+
+    if candidate_points_to_target and target_points_to_candidate:
+        strength = max(strength, 0.98 if cued_cross else 0.95)
+        reasons.append(
+            f"mutual brief-ID references ({target_file_id} <-> {candidate_file_id})"
+        )
+    elif candidate_points_to_target:
+        strength = max(strength, 0.94 if cued_cross else 0.90)
+        reasons.append(f"candidate references target brief ID {target_file_id}")
+    elif target_points_to_candidate:
+        strength = max(strength, 0.94 if cued_cross else 0.90)
+        reasons.append(f"target references candidate brief ID {candidate_file_id}")
+
+    if strength <= 0.0:
+        return empty
+
+    return {
+        "scoring_path": "reference",
+        "reference_strength": round(strength, 6),
+        "reference_id_boost": round(strength, 6),
+        "reference_boost_reasons": reasons,
+        "has_copy_refer_signal": True,
+    }
+
+
+def _asset_structure_similarity(target_campaign: Campaign, candidate_campaign: Campaign) -> float:
+    target_assets = target_campaign.assets.model_dump(mode="python")
+    candidate_assets = candidate_campaign.assets.model_dump(mode="python")
+    keys = sorted(set(target_assets.keys()) | set(candidate_assets.keys()))
+    target_vector = _binary_presence_vector([target_assets.get(key, "") for key in keys])
+    candidate_vector = _binary_presence_vector([candidate_assets.get(key, "") for key in keys])
+    presence = _vector_similarity(target_vector, candidate_vector)
+    text = _text_similarity(
+        _join_non_empty_values([target_assets.get(key, "") for key in keys]),
+        _join_non_empty_values([candidate_assets.get(key, "") for key in keys]),
+    )
+    if presence > 0 and text > 0:
+        return (0.55 * presence) + (0.45 * text)
+    return presence or text
+
+
+def _style_direction_section_similarity(
+    target_campaign: Campaign,
+    candidate_campaign: Campaign,
+) -> Dict[str, float]:
+    """
+    Single StyleDirection-section score combining:
+      Style Direction, Additional Style, Vehicle Photography, Logos, and Assets columns.
+    """
+    target_style = target_campaign.style_descriptions
+    candidate_style = candidate_campaign.style_descriptions
+    field_pairs = [
+        (
+            getattr(target_style, "asset_style_direction", "") or "",
+            getattr(candidate_style, "asset_style_direction", "") or "",
+        ),
+        (
+            getattr(target_style, "additional_style_information", "") or "",
+            getattr(candidate_style, "additional_style_information", "") or "",
+        ),
+        (
+            getattr(target_style, "vehicle_photography", "") or "",
+            getattr(candidate_style, "vehicle_photography", "") or "",
+        ),
+        (
+            getattr(target_style, "logos", "") or "",
+            getattr(candidate_style, "logos", "") or "",
+        ),
+    ]
+
+    field_scores: List[float] = []
+    for left, right in field_pairs:
+        if not _normalize_text(left) and not _normalize_text(right):
+            continue
+        field_scores.append(_text_similarity(left, right))
+
+    style_fields_similarity = (
+        sum(field_scores) / len(field_scores) if field_scores else 0.0
+    )
+    asset_structure_similarity = _asset_structure_similarity(target_campaign, candidate_campaign)
+
+    if style_fields_similarity > 0 and asset_structure_similarity > 0:
+        style_direction_similarity = (0.5 * style_fields_similarity) + (0.5 * asset_structure_similarity)
+    else:
+        style_direction_similarity = style_fields_similarity or asset_structure_similarity
+
+    return {
+        "style_direction_similarity": style_direction_similarity,
+        "style_fields_similarity": style_fields_similarity,
+        "asset_structure_similarity": asset_structure_similarity,
+    }
+
+
+def _campaign_wording_similarity(target_campaign: Campaign, candidate_campaign: Campaign) -> float:
+    """
+    Campaign structure + wording: offer-field presence pattern plus offer text similarity.
+    """
+    target_offer = target_campaign.offer_details.model_dump(mode="python")
+    candidate_offer = candidate_campaign.offer_details.model_dump(mode="python")
+    offer_keys = ["headline", "offer", "body", "cta", "disclaimer"]
+
+    structure = _vector_similarity(
+        _binary_presence_vector([target_offer.get(key, "") for key in offer_keys]),
+        _binary_presence_vector([candidate_offer.get(key, "") for key in offer_keys]),
+    )
+    wording = _text_similarity(
+        _join_non_empty_values([target_offer.get(key, "") for key in offer_keys]),
+        _join_non_empty_values([candidate_offer.get(key, "") for key in offer_keys]),
+    )
+    return (0.30 * structure) + (0.70 * wording)
+
+
+def _dealership_relationship_score(target_brief: CampaignBrief, candidate_brief: CampaignBrief) -> float:
+    """
+    Dealership / OEM / group proximity:
+      same accountID -> 1.0
+      same group folder -> 0.85
+      otherwise dealership-name text similarity
+    """
+    target_family = extract_family_slug_from_filename(target_brief.spreadsheet_path or "")
+    candidate_family = extract_family_slug_from_filename(candidate_brief.spreadsheet_path or "")
+    if target_family and candidate_family and target_family == candidate_family:
+        return 1.0
+
+    try:
+        target_hierarchy = classify_campaign_path_hierarchy(target_brief.spreadsheet_path or "")
+        candidate_hierarchy = classify_campaign_path_hierarchy(candidate_brief.spreadsheet_path or "")
+        target_group = str(target_hierarchy.get("group_folder") or "").strip().lower()
+        candidate_group = str(candidate_hierarchy.get("group_folder") or "").strip().lower()
+        if target_group and candidate_group and target_group == candidate_group:
+            return 0.85
+    except Exception:
+        pass
+
+    target_name = _normalize_text(target_brief.dealership_name or "")
+    candidate_name = _normalize_text(candidate_brief.dealership_name or "")
+    if not target_name or not candidate_name:
+        return 0.0
+    return _text_similarity(target_name, candidate_name)
+
+
+def compute_campaign_similarity(
+    target_campaign: Campaign,
+    candidate_campaign: Campaign,
+    dealership_relationship: float,
+    *,
+    target_brief: Optional[CampaignBrief] = None,
+    candidate_brief: Optional[CampaignBrief] = None,
+) -> Dict[str, Any]:
+    """
+    Dual-path campaign similarity used to decide absolute campaign pairing:
+
+    Always:
+      10% dealership / OEM / group proximity
+
+    Reference path (copy/refer cue + matching A-/D- IDs in same account/group):
+      75% reference_strength + 15% content blend (style/assets + wording)
+
+    Content path (no copy/refer ID signal):
+      60% StyleDirection section + 30% campaign wording/structure
+    """
+    style_section = _style_direction_section_similarity(target_campaign, candidate_campaign)
+    style_direction_similarity = float(style_section["style_direction_similarity"])
+    campaign_wording_similarity = _campaign_wording_similarity(target_campaign, candidate_campaign)
+    dealership_relationship = max(0.0, min(1.0, float(dealership_relationship)))
+    content_blend = (0.67 * style_direction_similarity) + (0.33 * campaign_wording_similarity)
+
+    ref_info: Dict[str, Any] = {
+        "scoring_path": "content",
+        "reference_strength": 0.0,
+        "reference_id_boost": 0.0,
+        "reference_boost_reasons": [],
+        "has_copy_refer_signal": False,
+    }
+    if target_brief is not None and candidate_brief is not None:
+        ref_info = _reference_path_signal(
+            target_campaign,
+            candidate_campaign,
+            target_brief,
+            candidate_brief,
+        )
+
+    scoring_path = str(ref_info.get("scoring_path") or "content")
+    reference_strength = float(ref_info.get("reference_strength", 0.0) or 0.0)
+
+    if scoring_path == "reference" and reference_strength > 0:
+        weighted = (
+            (0.10 * dealership_relationship)
+            + (0.75 * reference_strength)
+            + (0.15 * content_blend)
+        )
+        pair_basis = "reference"
+    else:
+        scoring_path = "content"
+        weighted = (
+            (0.10 * dealership_relationship)
+            + (0.60 * style_direction_similarity)
+            + (0.30 * campaign_wording_similarity)
+        )
+        if style_direction_similarity >= campaign_wording_similarity:
+            pair_basis = "style_assets"
+        else:
+            pair_basis = "content"
+
+    final_score = max(0.0, min(1.0, weighted))
+    return {
+        "similarity_score": round(final_score, 6),
+        "scoring_path": scoring_path,
+        "pair_basis": pair_basis,
+        "style_direction_similarity": round(style_direction_similarity, 6),
+        "style_fields_similarity": round(float(style_section["style_fields_similarity"]), 6),
+        "asset_structure_similarity": round(float(style_section["asset_structure_similarity"]), 6),
+        "campaign_wording_similarity": round(campaign_wording_similarity, 6),
+        "dealership_relationship": round(dealership_relationship, 6),
+        "reference_strength": round(reference_strength, 6),
+        "reference_id_boost": round(float(ref_info.get("reference_id_boost", 0.0) or 0.0), 6),
+        "reference_boost_reasons": list(ref_info.get("reference_boost_reasons", []) or []),
+        "has_copy_refer_signal": bool(ref_info.get("has_copy_refer_signal")),
+        "asset_and_style_similarity": round(style_direction_similarity, 6),
+    }
+
+
+def _classify_pair_status(
+    match: Dict[str, Any],
+    *,
+    absolute_threshold: float = 0.80,
+    likely_threshold: float = 0.70,
+    review_threshold: float = 0.50,
+) -> str:
+    """
+    Decide whether a scored campaign pair is an absolute pair, likely pair, review, or none.
+    """
+    overall = float(match.get("similarity_score", 0.0) or 0.0)
+    style = float(match.get("style_direction_similarity", 0.0) or 0.0)
+    wording = float(match.get("campaign_wording_similarity", 0.0) or 0.0)
+    ref = float(match.get("reference_strength", match.get("reference_id_boost", 0.0)) or 0.0)
+    has_ref = bool(match.get("has_copy_refer_signal"))
+
+    # Absolute pairing: explicit copy/refer lock, or very strong style/assets agreement.
+    if has_ref and ref >= 0.90 and overall >= absolute_threshold:
+        return "absolute"
+    if style >= 0.82 and overall >= absolute_threshold:
+        return "absolute"
+    if style >= 0.75 and wording >= 0.70 and overall >= absolute_threshold:
+        return "absolute"
+
+    if overall >= likely_threshold and (style >= 0.65 or has_ref or wording >= 0.70):
+        return "likely"
+
+    if overall >= review_threshold:
+        return "review"
+    return "none"
+
+
+def _pair_priority_key(match: Dict[str, Any]) -> tuple:
+    status_rank = {"absolute": 0, "likely": 1, "review": 2, "none": 3}
+    basis_rank = {"reference": 0, "style_assets": 1, "content": 2, "mixed": 3}
+    return (
+        status_rank.get(str(match.get("pair_status") or "none"), 9),
+        basis_rank.get(str(match.get("pair_basis") or "content"), 9),
+        -float(match.get("similarity_score", 0.0) or 0.0),
+        -float(match.get("style_direction_similarity", 0.0) or 0.0),
+        -float(match.get("reference_strength", 0.0) or 0.0),
+    )
+
+
+def _assign_one_to_one_pairs(scored_pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Greedy 1:1 assignment so each target campaign and each candidate campaign
+    appears in at most one selected pair.
+    """
+    used_targets: set = set()
+    used_candidates: set = set()
+    assigned: List[Dict[str, Any]] = []
+    for match in sorted(scored_pairs, key=_pair_priority_key):
+        if str(match.get("pair_status") or "none") == "none":
+            continue
+        target_id = str(match.get("target_campaign_id") or "").strip()
+        candidate_id = str(match.get("candidate_campaign_id") or "").strip()
+        if not target_id or not candidate_id:
+            continue
+        if target_id in used_targets or candidate_id in used_candidates:
+            continue
+        used_targets.add(target_id)
+        used_candidates.add(candidate_id)
+        assigned.append(match)
+    return assigned
+
+
+def resolve_global_campaign_pairs(
+    matches: List[Dict[str, Any]],
+    *,
+    target_campaign_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Resolve absolute/likely/review pairs across all candidate files.
+
+    Each target campaign may pair to at most one candidate campaign (file + Content ID).
+    """
+    usable = [dict(item) for item in matches if isinstance(item, dict)]
+    for item in usable:
+        if not item.get("pair_status"):
+            item["pair_status"] = _classify_pair_status(item)
+
+    used_targets: set = set()
+    used_candidate_keys: set = set()
+    absolute_pairs: List[Dict[str, Any]] = []
+    likely_pairs: List[Dict[str, Any]] = []
+    review_pairs: List[Dict[str, Any]] = []
+
+    for match in sorted(usable, key=_pair_priority_key):
+        status = str(match.get("pair_status") or "none")
+        if status == "none":
+            continue
+        target_id = str(match.get("target_campaign_id") or "").strip()
+        candidate_id = str(match.get("candidate_campaign_id") or "").strip()
+        file_name = str(match.get("file_name") or "").strip()
+        candidate_key = f"{file_name}|{candidate_id}"
+        if not target_id or not candidate_id:
+            continue
+        if target_id in used_targets or candidate_key in used_candidate_keys:
+            continue
+        used_targets.add(target_id)
+        used_candidate_keys.add(candidate_key)
+        if status == "absolute":
+            absolute_pairs.append(match)
+        elif status == "likely":
+            likely_pairs.append(match)
+        elif status == "review":
+            review_pairs.append(match)
+
+    known_targets = [
+        str(cid).strip()
+        for cid in (target_campaign_ids or [])
+        if str(cid).strip()
+    ]
+    if not known_targets:
+        known_targets = sorted(
+            {
+                str(item.get("target_campaign_id") or "").strip()
+                for item in usable
+                if str(item.get("target_campaign_id") or "").strip()
+            }
+        )
+    unpaired_targets = [cid for cid in known_targets if cid not in used_targets]
+
+    # Compatibility buckets used by existing agent/report paths.
+    strong_matches = absolute_pairs + likely_pairs
+    review_matches = review_pairs
+    return {
+        "absolute_pairs": absolute_pairs,
+        "likely_pairs": likely_pairs,
+        "review_pairs": review_pairs,
+        "unpaired_targets": unpaired_targets,
+        "strong_matches": strong_matches,
+        "review_matches": review_matches,
+    }
+
+
+def _summarize_brief_match(
+    target_brief: CampaignBrief,
+    candidate_brief: CampaignBrief,
+    assigned_pairs: List[Dict[str, Any]],
+    *,
+    likely_threshold: float,
+    review_threshold: float,
+) -> Dict[str, Any]:
+    """Score the two briefs as wholes. Extra campaigns on the longer brief are not zeros."""
+    target_count = len(target_brief.campaigns)
+    candidate_count = len(candidate_brief.campaigns)
+    smaller = min(target_count, candidate_count)
+    same_count = target_count == candidate_count and target_count > 0
+
+    def _kept(pair: Dict[str, Any], threshold: float) -> bool:
+        status = str(pair.get("pair_status") or "")
+        score = float(pair.get("similarity_score") or 0.0)
+        if status not in {"absolute", "likely", "review"}:
+            return False
+        return score >= threshold
+
+    review_pairs = [pair for pair in assigned_pairs if _kept(pair, review_threshold)]
+    likely_pairs = [
+        pair
+        for pair in assigned_pairs
+        if str(pair.get("pair_status") or "") in {"absolute", "likely"}
+        and float(pair.get("similarity_score") or 0.0) >= likely_threshold
+    ]
+    coverage = (min(len(review_pairs), smaller) / smaller) if smaller else 0.0
+    if same_count and len(review_pairs) >= target_count:
+        kind = "aligned"
+        pool = review_pairs
+    elif (not same_count) and smaller > 0 and len(likely_pairs) >= smaller:
+        kind = "complementation"
+        pool = likely_pairs
+    else:
+        kind = "none"
+        pool = review_pairs
+    score = (
+        sum(float(pair.get("similarity_score") or 0.0) for pair in pool) / len(pool)
+        if pool
+        else 0.0
+    )
+    return {
+        "brief_similarity_score": round(score, 6),
+        "match_kind": kind,
+        "coverage": round(coverage, 6),
+    }
+
+
+def compare_briefs_and_rank(
+    target_brief: CampaignBrief,
+    candidate_brief: CampaignBrief,
+    strong_threshold: float = 0.80,
+    review_threshold: float = 0.50,
+    likely_threshold: float = 0.70,
+) -> Dict[str, Any]:
+    """
+    Score target vs candidate campaigns and assign absolute 1:1 pairs inside this file.
+
+    Pairing priority:
+      1) copy/refer reference locks
+      2) strong StyleDirection/assets (+ wording) agreement
+      3) review-level content similarity
+    """
+    dealership_relationship = _dealership_relationship_score(target_brief, candidate_brief)
+    scored_pairs: List[Dict[str, Any]] = []
+    for target_campaign in target_brief.campaigns:
+        for candidate_campaign in candidate_brief.campaigns:
+            scores = compute_campaign_similarity(
+                target_campaign=target_campaign,
+                candidate_campaign=candidate_campaign,
+                dealership_relationship=dealership_relationship,
+                target_brief=target_brief,
+                candidate_brief=candidate_brief,
+            )
+            current = {
+                "target_campaign_id": target_campaign.campaign_id,
+                "candidate_campaign_id": candidate_campaign.campaign_id,
+                **scores,
+            }
+            current["pair_status"] = _classify_pair_status(
+                current,
+                absolute_threshold=strong_threshold,
+                likely_threshold=likely_threshold,
+                review_threshold=review_threshold,
+            )
+            scored_pairs.append(current)
+
+    assigned_pairs = _assign_one_to_one_pairs(scored_pairs)
+    absolute_pairs = [m for m in assigned_pairs if m.get("pair_status") == "absolute"]
+    likely_pairs = [m for m in assigned_pairs if m.get("pair_status") == "likely"]
+    review_pairs = [m for m in assigned_pairs if m.get("pair_status") == "review"]
+    strong_matches = absolute_pairs + likely_pairs
+
+    paired_targets = {str(m.get("target_campaign_id") or "") for m in assigned_pairs}
+    unpaired_targets = [
+        campaign.campaign_id
+        for campaign in target_brief.campaigns
+        if campaign.campaign_id not in paired_targets
+    ]
+
+    assigned_pairs.sort(key=_pair_priority_key)
+    brief_match = _summarize_brief_match(
+        target_brief,
+        candidate_brief,
+        assigned_pairs,
+        likely_threshold=likely_threshold,
+        review_threshold=review_threshold,
+    )
+    scored_by_score = sorted(
+        scored_pairs,
+        key=lambda item: float(item.get("similarity_score", 0.0) or 0.0),
+        reverse=True,
+    )
+    # Use assigned pairs when available; otherwise report the strongest raw scores
+    # so console/report averages are not zeroed just because nothing cleared thresholds.
+    reporting_pool = assigned_pairs if assigned_pairs else scored_by_score[: max(1, len(target_brief.campaigns))]
+    file_similarity = (
+        float(reporting_pool[0]["similarity_score"]) if reporting_pool else 0.0
+    )
+    best_raw_pair = scored_by_score[0] if scored_by_score else None
+
+    def _avg(key: str, rows: Optional[List[Dict[str, Any]]] = None) -> float:
+        pool = rows if rows is not None else reporting_pool
+        if not pool:
+            return 0.0
+        return sum(float(item.get(key, 0.0) or 0.0) for item in pool) / len(pool)
+
+    return {
+        "file_similarity_score": round(file_similarity, 6),
+        "component_averages": {
+            "style_direction_similarity": round(_avg("style_direction_similarity"), 6),
+            "style_fields_similarity": round(_avg("style_fields_similarity"), 6),
+            "asset_structure_similarity": round(_avg("asset_structure_similarity"), 6),
+            "campaign_wording_similarity": round(_avg("campaign_wording_similarity"), 6),
+            "dealership_relationship": round(_avg("dealership_relationship"), 6),
+            "reference_strength": round(_avg("reference_strength"), 6),
+            "reference_id_boost": round(_avg("reference_id_boost"), 6),
+            "asset_and_style_similarity": round(_avg("style_direction_similarity"), 6),
+        },
+        "best_campaign_matches": assigned_pairs,
+        "best_raw_pair": best_raw_pair,
+        "absolute_pairs": absolute_pairs,
+        "likely_pairs": likely_pairs,
+        "review_pairs": review_pairs,
+        "unpaired_targets": unpaired_targets,
+        "strong_matches": strong_matches,
+        "review_matches": review_pairs,
+        "all_scored_pairs": scored_pairs,
+        "brief_similarity_score": brief_match["brief_similarity_score"],
+        "match_kind": brief_match["match_kind"],
+        "coverage": brief_match["coverage"],
+    }
+
+
+def write_family_similarity_outputs(
+    target_brief: CampaignBrief,
+    similarity_payload: Dict[str, Any],
+) -> Dict[str, str]:
+    """
+    Write JSON and TXT outputs for the family-similarity branch.
+    """
+    project_root = Path(__file__).parent.parent
+    results_dir = project_root / "results"
+    similarity_dir = results_dir / "similarity"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    similarity_dir.mkdir(parents=True, exist_ok=True)
+
+    target_name = Path(target_brief.spreadsheet_path).name
+    target_stem = Path(target_name).stem
+    json_path = similarity_dir / f"{target_stem}-family-similarity.json"
+    report_path = results_dir / f"{target_stem}-family-similarity-report.txt"
+
+    with open(json_path, "w", encoding="utf-8") as file:
+        json.dump(similarity_payload, file, indent=2, ensure_ascii=False)
+
+    absolute_pairs = similarity_payload.get("absolute_pairs") or similarity_payload.get("strong_matches", [])
+    likely_pairs = similarity_payload.get("likely_pairs") or []
+    review_pairs = similarity_payload.get("review_pairs") or similarity_payload.get("review_matches", [])
+    unpaired_targets = similarity_payload.get("unpaired_targets") or []
+
+    def _append_pair_lines(lines: List[str], items: List[Dict[str, Any]]) -> None:
+        if not items:
+            lines.append("None")
+            return
+        for idx, item in enumerate(items, start=1):
+            lines.append(
+                f"{idx}. [{item.get('pair_status', 'n/a')}] {item.get('similarity_percent', 0):.2f}% | "
+                f"Target {item.get('target_campaign_id')} <-> Candidate {item.get('candidate_campaign_id')} | "
+                f"File: {item.get('file_name')} | basis={item.get('pair_basis', item.get('scoring_path', 'n/a'))}"
+            )
+            lines.append(
+                "   Breakdown: "
+                f"path={item.get('scoring_path', 'content')} | "
+                f"styleDirection={float(item.get('style_direction_similarity', item.get('asset_and_style_similarity', 0.0))) * 100:.1f}% "
+                f"(styleFields={float(item.get('style_fields_similarity', 0.0)) * 100:.1f}%, "
+                f"assets={float(item.get('asset_structure_similarity', 0.0)) * 100:.1f}%), "
+                f"wording={float(item.get('campaign_wording_similarity', 0.0)) * 100:.1f}%, "
+                f"dealership={float(item.get('dealership_relationship', 0.0)) * 100:.1f}%, "
+                f"refStrength={float(item.get('reference_strength', item.get('reference_id_boost', 0.0))) * 100:.1f}%"
+            )
+            boost_reasons = item.get("reference_boost_reasons", []) or []
+            if isinstance(boost_reasons, list) and boost_reasons:
+                lines.append(f"   Ref signal: {'; '.join(str(r) for r in boost_reasons[:3])}")
+            reason = str(item.get("match_reason", "")).strip()
+            evidence_points = item.get("evidence_points", []) or []
+            if reason:
+                lines.append(f"   Reason: {reason}")
+            if isinstance(evidence_points, list) and evidence_points:
+                for evidence in evidence_points[:4]:
+                    lines.append(f"   - Evidence: {str(evidence)}")
+
+    lines: List[str] = []
+    lines.append(f"File Name: {target_name}")
+    lines.append(
+        "Dealership Name and ID: "
+        f"{similarity_payload.get('dealership_name', 'N/A')} "
+        f"({similarity_payload.get('dealership_family_id', 'N/A')})"
+    )
+    lines.append(f"Type of Task: {similarity_payload.get('task_type', 'N/A')}")
+    lines.append("")
+    lines.append("Absolute campaign pairs (reference and/or strong style-assets lock):")
+    _append_pair_lines(lines, absolute_pairs if isinstance(absolute_pairs, list) else [])
+    lines.append("")
+    lines.append("Likely campaign pairs:")
+    _append_pair_lines(lines, likely_pairs if isinstance(likely_pairs, list) else [])
+    lines.append("")
+    lines.append("Campaign pairs for human review:")
+    _append_pair_lines(lines, review_pairs if isinstance(review_pairs, list) else [])
+    lines.append("")
+    lines.append("Unpaired target campaigns:")
+    if unpaired_targets:
+        for idx, campaign_id in enumerate(unpaired_targets, start=1):
+            lines.append(f"{idx}. {campaign_id}")
+    else:
+        lines.append("None")
+
+    with open(report_path, "w", encoding="utf-8") as file:
+        file.write("\n".join(lines))
+
+    return {"json_path": str(json_path), "report_path": str(report_path)}
 
 
 def _get_qdrant_client():
@@ -1484,11 +2531,17 @@ def find_and_load_previous_campaign_brief(
         project_root = Path(__file__).parent.parent
         local_xlsx_files = list(project_root.glob("*.xlsx"))
         
-        # Find local files containing the campaign ID in filename
-        matching_local_files = [
-            f for f in local_xlsx_files
-            if previous_campaign_id.upper() in f.name.upper()
-        ]
+        previous_id_normalized = str(previous_campaign_id or "").strip().upper()
+        # Use shared filename parser first (A-/D- aware), then keep legacy substring fallback.
+        matching_local_files = []
+        for local_file in local_xlsx_files:
+            parsed_name = parse_brief_filename(local_file.name)
+            parsed_token = str(parsed_name.get("campaign_token", "")).upper() if parsed_name else ""
+            if parsed_token and parsed_token == previous_id_normalized:
+                matching_local_files.append(local_file)
+                continue
+            if previous_id_normalized and previous_id_normalized in local_file.name.upper():
+                matching_local_files.append(local_file)
         
         if matching_local_files:
             # Use the first matching local file
@@ -1603,10 +2656,16 @@ def find_and_load_previous_campaign_brief(
             )
         
         # Find file(s) containing the previous campaign ID in the filename
-        matching_files_with_id = [
-            (f, folder_path) for f, folder_path in matching_files
-            if previous_campaign_id.upper() in f["name"].upper()
-        ]
+        matching_files_with_id = []
+        for file_meta, folder_path in matching_files:
+            file_name = str(file_meta.get("name", ""))
+            parsed_name = parse_brief_filename(file_name)
+            parsed_token = str(parsed_name.get("campaign_token", "")).upper() if parsed_name else ""
+            if parsed_token and parsed_token == previous_id_normalized:
+                matching_files_with_id.append((file_meta, folder_path))
+                continue
+            if previous_id_normalized and previous_id_normalized in file_name.upper():
+                matching_files_with_id.append((file_meta, folder_path))
         
         if not matching_files_with_id:
             # Show some example filenames for debugging
@@ -1901,31 +2960,18 @@ def write_document_to_file(
         JSON string with success status, file_path, and file_name
     """
     try:
-        project_root = Path(__file__).parent.parent
-        results_dir = project_root / "results"
-        results_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Ensure the file_name doesn't contain path separators (security)
-        if "/" in file_name or "\\" in file_name:
-            # Extract just the filename
-            file_name = Path(file_name).name
-        file_path = results_dir / file_name
-        
-        # Write the content to the file
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        
         result = {
             "success": True,
-            "file_path": str(file_path),
+            "file_path": "",
             "file_name": file_name,
             "document_type": document_type,
             "content_length": len(content),
-            "message": f"Successfully wrote {document_type} document to results/{file_name}"
+            "message": f"Stored {document_type} document {file_name} for Supabase.",
         }
-        
-        print(f"[Document Creator Tool] ✓ Wrote {document_type} document: {file_name} ({len(content)} characters)")
-        
+        from graph.document_sink import remember_document
+
+        remember_document(file_name, document_type, content)
+        print(f"[Document Creator Tool] Stored {document_type} document: {file_name} ({len(content)} characters)")
         return json.dumps(result, indent=2)
     
     except Exception as e:
@@ -1985,6 +3031,10 @@ def get_available_tools(agent_name: Optional[str] = None) -> list:
         "campaign_update_agent": campaign_update_tools,  # Has RAG access + previous campaign ID identification
         "qa_agent": qa_agent_tools,  # Has RAG access for QA rules + campaign brief retrieval + similar diagnoses search
         "document_creator_agent": document_creator_agent_tools,  # Has RAG access + text document storage
+        "family_similarity_agent": [],  # Synthesizer; specialists are invoked directly
+        "family_sim_reference_agent": [],
+        "family_sim_style_agent": [],
+        "family_sim_wording_agent": [],
     }
     
     # Normalize agent name
